@@ -335,6 +335,58 @@ def prepare_phase2_data(
 
 
 # ---------------------------------------------------------------------------
+# Load pre-tokenized .npy shards from Hugging Face  (downloaded → merged .bin)
+# ---------------------------------------------------------------------------
+
+def download_npy_shards(
+    repo_id: str,
+    revision: str = "phase1",
+    cache_dir: str = "data",
+    hf_token: Optional[str] = None,
+) -> str:
+    """Download .npy shards from a HF dataset repo and merge into a single .bin."""
+    from huggingface_hub import HfApi, hf_hub_download
+
+    bin_path = Path(cache_dir) / f"{revision}.bin"
+    done_flag = Path(cache_dir) / f".{revision}_done"
+
+    if done_flag.exists() and bin_path.exists():
+        n = bin_n_tokens(str(bin_path))
+        print(f"  {revision} cache found: {bin_path} ({n:,} tokens)")
+        return str(bin_path)
+
+    api = HfApi(token=hf_token)
+    files = api.list_repo_files(repo_id, repo_type="dataset", revision=revision)
+    npy_files = sorted(f for f in files if f.endswith(".npy"))
+
+    if not npy_files:
+        raise FileNotFoundError(f"No .npy files found in {repo_id}@{revision}")
+
+    print(f"  Downloading {len(npy_files)} .npy shards from {repo_id}@{revision} ...")
+    tmp_dir = Path(cache_dir) / f"tmp_{revision}_npy"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    shard_bins = []
+
+    for i, fname in enumerate(npy_files):
+        local = hf_hub_download(
+            repo_id, fname, repo_type="dataset",
+            revision=revision, token=hf_token,
+            cache_dir=str(tmp_dir / "hf_cache"),
+        )
+        arr = np.load(local)
+        shard = tmp_dir / f"shard_{i}.bin"
+        arr.tofile(str(shard))
+        shard_bins.append(str(shard))
+        print(f"    [{i+1}/{len(npy_files)}] {Path(fname).name}  ({len(arr):,} tokens)")
+
+    total = concatenate_bins(shard_bins, str(bin_path))
+    print(f"  Merged → {bin_path} ({total:,} tokens)")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    done_flag.touch()
+    return str(bin_path)
+
+
+# ---------------------------------------------------------------------------
 # Fast memory-mapped dataset  (zero-copy, multi-worker safe)
 # ---------------------------------------------------------------------------
 

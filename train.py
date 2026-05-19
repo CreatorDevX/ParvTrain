@@ -20,6 +20,7 @@ from dataset import (
     prepare_phase2_data,
     build_dataloader,
     load_hastings,
+    download_npy_shards,
     PHASE2_CURRICULUM,
 )
 
@@ -39,21 +40,43 @@ DEFAULT_DATA = [
 ]
 
 
+def train_cli(args):
+    # ── All I/O in parent process (no NCCL, no GPU) ──
+    print("=== Parv: Preparing data (parent process) ===")
+    tokenizer = load_hastings(args.hastings_path)
+    print(f"  Tokenizer: vocab_size={tokenizer.vocab_size}")
+
+    if args.npy_repo:
+        # Load pre-tokenized .npy shards from HF
+        print(f"Downloading pre-tokenized data from {args.npy_repo} ...")
+        download_npy_shards(args.npy_repo, revision="phase1", hf_token=args.hf_token)
+        download_npy_shards(args.npy_repo, revision="phase2", hf_token=args.hf_token)
+    else:
+        # Tokenize from scratch
+        prepare_phase1_data(args.data, tokenizer, cache_dir="data")
+        ds_exists = os.path.exists("data/phase2.bin")
+        if not ds_exists:
+            prepare_phase2_data(args.hf_dataset_p2, args.n_samples_p2, tokenizer, cache_dir="data")
+        else:
+            print(f"  Phase 2 cache found: data/phase2.bin")
+
+    print("Data ready. Launching GPU processes...")
+    print()
+
+    # ── Spawn GPU processes (fast path — all cached) ──
+    tmp.set_start_method("spawn", force=True)
+    n = args.num_gpus or torch.cuda.device_count()
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+    os.environ["WORLD_SIZE"] = str(n)
+    tmp.spawn(_spawn_wrapper, args=(args,), nprocs=n, join=True)
+
+
 def _spawn_wrapper(local_rank, args):
     os.environ["RANK"] = str(local_rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["LOCAL_WORLD_SIZE"] = str(os.environ["WORLD_SIZE"])
     _train_impl(args)
-
-def train_cli(args):
-    tmp.set_start_method("spawn", force=True)
-    n = args.num_gpus or torch.cuda.device_count()
-
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29500"
-    os.environ["WORLD_SIZE"] = str(n)
-
-    tmp.spawn(_spawn_wrapper, args=(args,), nprocs=n, join=True)
 
 
 def _train_impl(args):
@@ -85,12 +108,8 @@ def _train_impl(args):
     log(f"  Phase 1:  batch/GPU={p1_bs}  grad_accum={p1_ga}  effective={eff_p1}")
     log(f"  Phase 2:  batch/GPU={p2_bs}  grad_accum={p2_ga}  effective={eff_p2}")
 
-    # ── tokenizer (load Hastings tiktoken, rank 0 only, then sync) ──
+    # ── tokenizer (cached from parent — instant) ──
     log(f"Loading tokenizer from {args.hastings_path}")
-    if is_main:
-        load_hastings(args.hastings_path)
-    if world_size > 1:
-        torch.distributed.barrier()
     tokenizer = load_hastings(args.hastings_path)
     log(f"  vocab_size={tokenizer.vocab_size}")
 
@@ -131,11 +150,7 @@ def _train_impl(args):
         init_kwargs={"wandb": {"name": run_name, "dir": args.checkpoint_dir}} if is_main else None,
     )
 
-    # ── pre-tokenize phase 1 → memmap ──
-    if is_main:
-        prepare_phase1_data(args.data, tokenizer, cache_dir="data")
-    if world_size > 1:
-        torch.distributed.barrier()
+    # ── data (cached from parent — instant) ──
     phase1_bin = prepare_phase1_data(args.data, tokenizer, cache_dir="data")
 
     # ── model ──
@@ -322,13 +337,7 @@ def _train_impl(args):
     # Phase 2  (Ultra-FineWeb curriculum)
     # ==================================================================
     log("=== Phase 2: Long-Context Curriculum ===")
-    # switch grad accum for phase 2
     accelerator.gradient_accumulation_plugin.num_steps = p2_ga
-
-    if is_main:
-        prepare_phase2_data(args.hf_dataset_p2, args.n_samples_p2, tokenizer, cache_dir="data")
-    if world_size > 1:
-        torch.distributed.barrier()
     phase2_bin = prepare_phase2_data(args.hf_dataset_p2, args.n_samples_p2, tokenizer, cache_dir="data")
 
     p2_curriculum = PHASE2_CURRICULUM
@@ -419,6 +428,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="parv")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
+    parser.add_argument("--npy-repo", type=str, default=None,
+                        help="HF dataset repo with pre-tokenized .npy shards (skips local tokenization)")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
