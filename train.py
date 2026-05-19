@@ -2,13 +2,13 @@ import os
 import math
 import random
 import shutil
-import multiprocessing as mp
 from pathlib import Path
 from typing import List, Optional
 
 import torch
+import torch.multiprocessing as tmp
 from torch.optim import AdamW
-from accelerate import Accelerator, notebook_launcher
+from accelerate import Accelerator
 from accelerate.utils import GradientAccumulationPlugin
 from huggingface_hub import HfApi, create_repo
 
@@ -40,15 +40,20 @@ DEFAULT_DATA = [
 
 
 def train_cli(args):
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
-    notebook_launcher(
-        _train_impl,
-        (args,),
-        num_processes=args.num_gpus,
-    )
+    tmp.set_start_method("spawn", force=True)
+    n = args.num_gpus or torch.cuda.device_count()
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+    os.environ["WORLD_SIZE"] = str(n)
+
+    def _spawn_fn(local_rank, args):
+        os.environ["RANK"] = str(local_rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ["LOCAL_WORLD_SIZE"] = str(n)
+        _train_impl(args)
+
+    tmp.spawn(_spawn_fn, args=(args,), nprocs=n, join=True)
 
 
 def _train_impl(args):
