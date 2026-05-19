@@ -240,21 +240,14 @@ def load_or_train_tokenizer(
         eos_token="<|endoftext|>",
         pad_token="<|pad|>",
     )
-    print("Downloading data for tokenizer training...")
-    # stream through files line-by-line for BPE training (no full load)
-    resolve_sources(text_paths, cache_dir="data/raw")
-    train_tokenizer(_stream_lines(text_paths), vocab_size=vocab_size, save_path=tokenizer_path)
-    return PreTrainedTokenizerFast(
-        tokenizer_file=tokenizer_path,
-        bos_token="<|endoftext|>",
-        eos_token="<|endoftext|>",
-        pad_token="<|pad|>",
-    )
 
 
 # ---------------------------------------------------------------------------
 # Prepare tokenized binary  (txt files → one big .bin)
 # ---------------------------------------------------------------------------
+
+CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB text chunks
+
 
 def prepare_phase1_data(
     data_paths: List[str],
@@ -273,25 +266,34 @@ def prepare_phase1_data(
     tmp_dir = Path(cache_dir) / "tmp_p1"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    def _tokenize_one(path_idx):
-        path, i = path_idx
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-        shard = str(tmp_dir / f"shard_{i}.bin")
-        # tiktoken.encode releases GIL — threads run in parallel
-        ids = tokenizer.enc.encode(text, allowed_special="all")
-        ids.append(tokenizer.eos_token_id)
-        arr = np.array(ids, dtype=np.uint16)
-        arr.tofile(shard)
-        return shard, len(ids), Path(path).name
+    def _tokenize_one(idx_and_path):
+        """Read & tokenize a file in 32 MB chunks — peak memory ~ one chunk."""
+        i, path = idx_and_path
+        out = str(tmp_dir / f"shard_{i}.bin")
+        total = 0
+        eos = tokenizer.eos_token_id
+        with open(out, "wb") as bin_f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    ids = tokenizer.enc.encode(chunk, allowed_special="all")
+                    total += len(ids)
+                    arr = np.array(ids, dtype=np.uint16)
+                    bin_f.write(arr.tobytes())
+            # append EOS once per file
+            bin_f.write(np.array([eos], dtype=np.uint16).tobytes())
+            total += 1
+        return out, total, Path(path).name
 
-    n_workers = min(len(resolved), os.cpu_count() or 4)
-    print(f"  Tokenizing {len(resolved)} files with {n_workers} threads...")
+    n_workers = min(len(resolved), 2)  # 2 max → at most 2 chunks in RAM = 64 MB + overhead
+    print(f"  Tokenizing {len(resolved)} files (2 workers, 32 MB chunks)...")
     shard_bins = [None] * len(resolved)
     total_tokens = 0
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        fut_map = {pool.submit(_tokenize_one, (p, i)): i for i, p in enumerate(resolved)}
+        fut_map = {pool.submit(_tokenize_one, (i, p)): i for i, p in enumerate(resolved)}
         for fut in as_completed(fut_map):
             i = fut_map[fut]
             shard, n, name = fut.result()
@@ -300,7 +302,7 @@ def prepare_phase1_data(
             print(f"    [{i+1}/{len(resolved)}] {name}: {n:,} tokens")
 
     print(f"  Total across all files: {total_tokens:,} tokens")
-    concatenate_bins(shard_bins, str(bin_path))
+    concatenate_bins([s for s in shard_bins if s], str(bin_path))
     print(f"  Saved to {bin_path}")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return str(bin_path)
