@@ -43,6 +43,7 @@ def train_cli(args):
         _train_impl,
         (args,),
         num_processes=args.num_gpus,
+        start_method="spawn",
     )
 
 
