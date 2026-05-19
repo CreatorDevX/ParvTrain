@@ -297,11 +297,6 @@ def _train_impl(args):
         try:
             batch = next(data_iter)
         except StopIteration:
-            dataloader = build_dataloader(
-                phase1_bin, seq_len=2048, batch_size=p1_bs, stride=512,
-                num_workers=args.num_workers,
-            )
-            dataloader = accelerator.prepare(dataloader)
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
@@ -309,15 +304,16 @@ def _train_impl(args):
             out = model(input_ids=batch["input_ids"], labels=batch["labels"],
                         global_step=step, warmup_steps=args.warmup_steps)
             accelerator.backward(out.loss)
-            accelerator.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
-            )
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
+                )
             optimizer.step()
-            scheduler.step()
             optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 step += 1
+                scheduler.step()
                 tokens_seen += batch["input_ids"].numel() * world_size * p1_ga
                 best_loss = min(best_loss, out.loss.item())
 
@@ -330,7 +326,8 @@ def _train_impl(args):
                     merge_lora(model)
                     push_lora()
                     log_metrics(1, 2048, out.loss.item(), {"event": "lora_merge"})
-                    reset_lora(model)
+                    reset_lora(model, r=args.lora_r)
+                    optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
@@ -374,15 +371,16 @@ def _train_impl(args):
             out = model(input_ids=batch["input_ids"], labels=batch["labels"],
                         global_step=step, warmup_steps=args.warmup_steps)
             accelerator.backward(out.loss)
-            accelerator.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
-            )
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
+                )
             optimizer.step()
-            scheduler.step()
             optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 step += 1
+                scheduler.step()
                 tok = batch["input_ids"].numel() * world_size * p2_ga
                 tokens_seen += tok
                 p2_tokens += tok
@@ -397,7 +395,8 @@ def _train_impl(args):
                     merge_lora(model)
                     push_lora()
                     log_metrics(2, spec.seq_len, out.loss.item(), {"event": "lora_merge"})
-                    reset_lora(model)
+                    reset_lora(model, r=args.lora_r)
+                    optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:

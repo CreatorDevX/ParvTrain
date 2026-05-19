@@ -17,6 +17,7 @@ class LoRALinear(nn.Module):
 
         self.lora_A = nn.Parameter(torch.randn(r, in_f) * 0.02)
         self.lora_B = nn.Parameter(torch.zeros(out_f, r))
+        self.disable_merge = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.linear(x)
@@ -26,11 +27,13 @@ class LoRALinear(nn.Module):
         return base + lora
 
     def merge(self):
-        if self.r > 0:
+        if self.r > 0 and not getattr(self, "disable_merge", False):
             self.linear.weight.data.add_((self.lora_B @ self.lora_A) * self.scaling)
 
     def reset_lora(self, r: Optional[int] = None):
-        if r is not None:
+        if getattr(self, "disable_merge", False):
+            return
+        if r is not None and r != self.r:
             self.r = r
             self.scaling = self.alpha / r if r > 0 else 1.0
             in_f = self.linear.in_features
@@ -63,6 +66,7 @@ class LoRAEmbedding(nn.Module):
 
         self.lora_A = nn.Parameter(torch.randn(r, d_model) * 0.02)
         self.lora_B = nn.Parameter(torch.zeros(vocab, r))
+        self.disable_merge = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.embedding(x)
@@ -73,14 +77,16 @@ class LoRAEmbedding(nn.Module):
         return base + lora
 
     def merge(self):
-        if self.r > 0:
+        if self.r > 0 and not getattr(self, "disable_merge", False):
             delta = (self.lora_B @ self.lora_A) * self.scaling
             self.embedding.weight.data.add_(delta)
             if hasattr(self.embedding, 'weight') and self.embedding.weight is not None:
                 pass
 
     def reset_lora(self, r: Optional[int] = None):
-        if r is not None:
+        if getattr(self, "disable_merge", False):
+            return
+        if r is not None and r != self.r:
             self.r = r
             self.scaling = self.alpha / r if r > 0 else 1.0
             d_model = self.embedding.embedding_dim
@@ -100,21 +106,43 @@ class LoRAEmbedding(nn.Module):
         self.scaling = state["scaling"].item()
 
 
-def _replace_with_lora(module: nn.Module, r: int = 4, alpha: float = 1.0, skip_names: set = None):
+def _replace_with_lora(module: nn.Module, r: int = 4, alpha: float = 1.0, skip_names: set = None, weight_map: dict = None):
     skip_names = skip_names or set()
+    if weight_map is None:
+        weight_map = {}
     for name, child in list(module.named_children()):
         full_name = f"{module._get_name()}.{name}" if hasattr(module, '_get_name') else name
         if any(s in name for s in skip_names):
             continue
 
         if isinstance(child, nn.Linear):
-            lora_layer = LoRALinear(child, r=r, alpha=alpha)
+            weight_id = id(child.weight)
+            if weight_id in weight_map:
+                existing = weight_map[weight_id]
+                lora_layer = LoRALinear(child, r=r, alpha=alpha)
+                lora_layer.lora_A = existing.lora_A
+                lora_layer.lora_B = existing.lora_B
+                lora_layer.scaling = existing.scaling
+                lora_layer.disable_merge = True
+            else:
+                lora_layer = LoRALinear(child, r=r, alpha=alpha)
+                weight_map[weight_id] = lora_layer
             setattr(module, name, lora_layer)
         elif isinstance(child, nn.Embedding):
-            lora_emb = LoRAEmbedding(child, r=r, alpha=alpha)
+            weight_id = id(child.weight)
+            if weight_id in weight_map:
+                existing = weight_map[weight_id]
+                lora_emb = LoRAEmbedding(child, r=r, alpha=alpha)
+                lora_emb.lora_A = existing.lora_A
+                lora_emb.lora_B = existing.lora_B
+                lora_emb.scaling = existing.scaling
+                lora_emb.disable_merge = True
+            else:
+                lora_emb = LoRAEmbedding(child, r=r, alpha=alpha)
+                weight_map[weight_id] = lora_emb
             setattr(module, name, lora_emb)
         else:
-            _replace_with_lora(child, r=r, alpha=alpha, skip_names=skip_names)
+            _replace_with_lora(child, r=r, alpha=alpha, skip_names=skip_names, weight_map=weight_map)
 
 
 def _collect_lora_modules(module: nn.Module) -> list:

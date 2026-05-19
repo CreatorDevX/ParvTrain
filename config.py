@@ -28,21 +28,31 @@ class MoEConfig:
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 32000
+    # ── ~152M total params / ~27M active params (excl. embedding) ──
+    # Total breakdown:
+    #   Embedding (tied):  12.3M
+    #   Attention (10L):    3.9M
+    #   Dense FFN (2L):     1.8M
+    #   Shared expert (8L): 7.1M
+    #   Routed 18×8L:     127.4M
+    #   Router+norms+glob:  0.1M
+    # Active per token:
+    #   Attention: 3.9M + Dense: 1.8M + Shared: 7.1M + top-2 routed: 14.2M = ~27M
+    vocab_size: int = 32768
     d_model: int = 384
-    n_layers: int = 12
-    n_moe_layers: int = 10
+    n_layers: int = 10
+    n_moe_layers: int = 8
     n_dense_layers: int = 2
     n_heads: int = 6
     n_kv_heads: int = 2
     d_head: int = 64
-    d_ff: int = 896
+    d_ff: int = 768
     activation: str = "swiglu"
     rope_base: int = 10000
     rope_scaling: Optional[RoPEScalingConfig] = None
     max_seq_len: int = 32768
     sliding_window: int = 4096
-    n_global_tokens: int = 48
+    n_global_tokens: int = 32
     use_flash_attn: bool = True
     tie_word_embeddings: bool = True
     moe: MoEConfig = field(default_factory=MoEConfig)
@@ -64,19 +74,19 @@ class ParvHFConfig(PretrainedConfig):
         self,
         vocab_size=32000,
         d_model=384,
-        n_layers=12,
-        n_moe_layers=10,
+        n_layers=10,
+        n_moe_layers=8,
         n_dense_layers=2,
         n_heads=6,
         n_kv_heads=2,
         d_head=64,
-        d_ff=896,
+        d_ff=768,
         activation="swiglu",
         rope_base=10000,
         rope_scaling=None,
         max_seq_len=32768,
         sliding_window=4096,
-        n_global_tokens=48,
+        n_global_tokens=32,
         use_flash_attn=True,
         tie_word_embeddings=True,
         moe=None,

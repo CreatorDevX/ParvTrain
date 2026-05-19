@@ -98,8 +98,8 @@ class YaRNRoPE(nn.Module):
         freqs = pos * inv_freq
         cos = freqs.cos().transpose(1, 2)
         sin = freqs.sin().transpose(1, 2)
-        cos = cos.repeat_interleave(2, dim=-1)
-        sin = sin.repeat_interleave(2, dim=-1)
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
         return cos, sin
 
 
@@ -128,12 +128,14 @@ class KVCache:
         n_kv_heads: int = 2,
         d_head: int = 64,
         quantize_8bit: bool = True,
+        n_global_tokens: int = 0,
     ):
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.n_kv_heads = n_kv_heads
         self.d_head = d_head
         self.quantize_8bit = quantize_8bit
+        self.n_global_tokens = n_global_tokens
         self.clear()
 
     def clear(self):
@@ -144,13 +146,13 @@ class KVCache:
         self.seq_len = 0
 
     def quantize(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        abs_max = x.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
+        abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
         scale = abs_max / 127.0
         quant = (x / scale).round().clamp(-128, 127).to(torch.int8)
         return quant, scale
 
-    def dequantize(self, quant: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return quant.float() * scale
+    def dequantize(self, quant: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        return (quant.float() * scale).to(dtype)
 
     def update(
         self, k: torch.Tensor, v: torch.Tensor
@@ -186,8 +188,8 @@ class KVCache:
             self.cache_v[:, :, self.seq_len : new_len] = v_q
             self.k_scales[:, :, self.seq_len : new_len] = k_s
             self.v_scales[:, :, self.seq_len : new_len] = v_s
-            full_k = self.dequantize(self.cache_k[:, :, :new_len], self.k_scales[:, :, :new_len])
-            full_v = self.dequantize(self.cache_v[:, :, :new_len], self.v_scales[:, :, :new_len])
+            full_k = self.dequantize(self.cache_k[:, :, :new_len], self.k_scales[:, :, :new_len], k.dtype)
+            full_v = self.dequantize(self.cache_v[:, :, :new_len], self.v_scales[:, :, :new_len], v.dtype)
         else:
             self.cache_k[:, :, self.seq_len : new_len] = k
             self.cache_v[:, :, self.seq_len : new_len] = v
@@ -198,11 +200,28 @@ class KVCache:
         return full_k, full_v
 
     def _evict(self, n_tokens: int):
-        self.cache_k = torch.roll(self.cache_k, shifts=-n_tokens, dims=2)
-        self.cache_v = torch.roll(self.cache_v, shifts=-n_tokens, dims=2)
-        if self.quantize_8bit:
-            self.k_scales = torch.roll(self.k_scales, shifts=-n_tokens, dims=2)
-            self.v_scales = torch.roll(self.v_scales, shifts=-n_tokens, dims=2)
+        g = self.n_global_tokens
+        if g > 0:
+            self.cache_k[:, :, g : -n_tokens] = self.cache_k[:, :, g + n_tokens :].clone()
+            self.cache_v[:, :, g : -n_tokens] = self.cache_v[:, :, g + n_tokens :].clone()
+            self.cache_k[:, :, -n_tokens:] = 0
+            self.cache_v[:, :, -n_tokens:] = 0
+            if self.quantize_8bit:
+                self.k_scales[:, :, g : -n_tokens] = self.k_scales[:, :, g + n_tokens :].clone()
+                self.v_scales[:, :, g : -n_tokens] = self.v_scales[:, :, g + n_tokens :].clone()
+                self.k_scales[:, :, -n_tokens:] = 0
+                self.v_scales[:, :, -n_tokens:] = 0
+        else:
+            self.cache_k = torch.roll(self.cache_k, shifts=-n_tokens, dims=2)
+            self.cache_v = torch.roll(self.cache_v, shifts=-n_tokens, dims=2)
+            self.cache_k[:, :, -n_tokens:] = 0
+            self.cache_v[:, :, -n_tokens:] = 0
+            if self.quantize_8bit:
+                self.k_scales = torch.roll(self.k_scales, shifts=-n_tokens, dims=2)
+                self.v_scales = torch.roll(self.v_scales, shifts=-n_tokens, dims=2)
+                self.k_scales[:, :, -n_tokens:] = 0
+                self.v_scales[:, :, -n_tokens:] = 0
+        self.seq_len -= n_tokens
 
 
 class Attention(nn.Module):
@@ -225,11 +244,6 @@ class Attention(nn.Module):
 
         self.rope = YaRNRoPE(config)
 
-        if config.n_global_tokens > 0:
-            self.global_tokens = nn.Parameter(
-                torch.randn(1, config.n_global_tokens, config.d_model) * 0.02
-            )
-
         self.kv_cache: Optional[KVCache] = None
 
     def init_kv_cache(self, max_batch_size: int = 1, max_seq_len: Optional[int] = None):
@@ -239,6 +253,7 @@ class Attention(nn.Module):
             n_kv_heads=self.n_kv_heads,
             d_head=self.d_head,
             quantize_8bit=self.config.use_kv_8bit,
+            n_global_tokens=self.n_global_tokens,
         )
 
     def clear_kv_cache(self):
@@ -247,23 +262,36 @@ class Attention(nn.Module):
 
     def _build_sliding_window_mask(
         self,
-        seq_len: int,
-        global_len: int,
-        start_pos: int,
+        q_len: int,
+        kv_len: int,
+        past_len: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        total_len = global_len + seq_len
-        mask = torch.full((seq_len, total_len), float("-inf"), dtype=dtype, device=device)
-
-        for i in range(seq_len):
-            global_end = global_len
-            mask[i, :global_end] = 0.0
-            local_start = max(global_len, global_len + i - self.sliding_window + 1)
-            local_end = global_len + i + start_pos + 1
-            if local_start < local_end:
-                mask[i, local_start:local_end] = 0.0
-
+        mask = torch.full((q_len, kv_len), float("-inf"), dtype=dtype, device=device)
+        
+        q_idx = torch.arange(past_len, past_len + q_len, device=device).unsqueeze(1)
+        kv_idx = torch.arange(0, kv_len, device=device).unsqueeze(0)
+        
+        # 1. Global tokens are always allowed to be attended to
+        is_global = kv_idx < self.n_global_tokens
+        
+        # 2. Local tokens are allowed if causal and within sliding window
+        causal = kv_idx <= q_idx
+        in_window = (q_idx - kv_idx) < self.sliding_window
+        
+        # 3. For global queries (q_idx < G), they can only attend to global tokens
+        # For local queries (q_idx >= G), they can attend to global tokens + local causal/window tokens
+        q_is_global = q_idx < self.n_global_tokens
+        
+        # Global queries: only attend to global tokens
+        global_query_mask = q_is_global & is_global
+        
+        # Local queries: attend to global tokens OR (local causal/window tokens)
+        local_query_mask = (~q_is_global) & (is_global | (causal & in_window))
+        
+        allowed = global_query_mask | local_query_mask
+        mask[allowed] = 0.0
         return mask.unsqueeze(0).unsqueeze(0)
 
     def forward(
@@ -284,65 +312,28 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k_rope = apply_rotary_emb(k, cos, sin)
 
+        # Scale query by attention_factor for YaRN RoPE scaling
+        if hasattr(self.rope, "attention_factor") and self.rope.attention_factor != 1.0:
+            q = q * math.sqrt(self.rope.attention_factor)
+
         if use_kv_cache and self.kv_cache is not None:
             k_rope, v = self.kv_cache.update(k_rope, v)
-            k_rope = k_rope.repeat_interleave(self.n_kv_groups, dim=1)
-            v = v.repeat_interleave(self.n_kv_groups, dim=1)
-            kv_len = k_rope.size(2)
-            attn_mask = None
-            if attention_mask is None:
-                attn_mask = torch.triu(
-                    torch.full((seq_len, kv_len), float("-inf"), dtype=x.dtype, device=device),
-                    diagonal=kv_len - seq_len + 1,
-                )
-                if self.sliding_window > 0 and kv_len > self.sliding_window:
-                    col = torch.arange(kv_len, device=device).unsqueeze(0)
-                    row = torch.arange(seq_len, device=device).unsqueeze(1) + kv_len - seq_len
-                    attn_mask = attn_mask.masked_fill(col < row - self.sliding_window, float("-inf"))
-            else:
-                attn_mask = attention_mask
-            out = F.scaled_dot_product_attention(q, k_rope, v, attn_mask=attn_mask, is_causal=False)
-            out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-            return self.o_proj(out)
 
-        if self.n_global_tokens > 0:
-            g_emb = self.global_tokens.expand(batch_size, -1, -1)
+        k_rope = k_rope.repeat_interleave(self.n_kv_groups, dim=1)
+        v = v.repeat_interleave(self.n_kv_groups, dim=1)
 
-            # Global cross-attention: g_Q attends to ALL local K,V (bidirectional)
-            g_q = self.q_proj(g_emb).view(batch_size, -1, self.n_heads, self.d_head).transpose(1, 2)
-            cos_0 = cos[:, :1, :]
-            sin_0 = sin[:, :1, :]
-            g_q = apply_rotary_emb(g_q, cos_0, sin_0)
+        past_len = k_rope.size(2) - seq_len
+        attn_mask = self._build_sliding_window_mask(
+            q_len=seq_len,
+            kv_len=k_rope.size(2),
+            past_len=past_len,
+            device=device,
+            dtype=x.dtype,
+        )
 
-            g_k_rep = k_rope.repeat_interleave(self.n_kv_groups, dim=1)
-            g_v_rep = v.repeat_interleave(self.n_kv_groups, dim=1)
-
-            g_attn = F.scaled_dot_product_attention(
-                g_q, g_k_rep, g_v_rep, attn_mask=None, is_causal=False,
-            )
-            g_attn = g_attn.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-            g_context = self.o_proj(g_attn)
-
-            # Global context as additional K,V for local attention (no RoPE)
-            global_k = self.k_proj(g_context).view(
-                batch_size, -1, self.n_kv_heads, self.d_head
-            ).transpose(1, 2)
-            global_v = self.v_proj(g_context).view(
-                batch_size, -1, self.n_kv_heads, self.d_head
-            ).transpose(1, 2)
-
-            k_full = torch.cat([global_k, k_rope], dim=2)
-            v_full = torch.cat([global_v, v], dim=2)
-            attn_mask = self._build_sliding_window_mask(seq_len, self.n_global_tokens, 0, device, x.dtype)
-        else:
-            k_full = k_rope
-            v_full = v
-            attn_mask = self._build_sliding_window_mask(seq_len, 0, 0, device, x.dtype)
-
-        k_full = k_full.repeat_interleave(self.n_kv_groups, dim=1)
-        v_full = v_full.repeat_interleave(self.n_kv_groups, dim=1)
-
-        out = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask, is_causal=False)
+        out = F.scaled_dot_product_attention(
+            q, k_rope, v, attn_mask=attn_mask, is_causal=False
+        )
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
 
@@ -361,11 +352,12 @@ class SwiGLUFFN(nn.Module):
 class ExpertFFN(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.gate_proj = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.up_proj = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.down_proj = nn.Linear(config.d_ff, config.d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.up_proj(x)))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class MoELayer(nn.Module):
@@ -504,6 +496,12 @@ class ParvModel(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+
+        if config.n_global_tokens > 0:
+            self.global_tokens = nn.Parameter(
+                torch.randn(1, config.n_global_tokens, config.d_model) * 0.02
+            )
+
         self.layers = nn.ModuleList()
         dense_indices = config.n_dense_layer_indices
 
@@ -524,7 +522,7 @@ class ParvModel(nn.Module):
     def _init_weights(self):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                if "router" not in name:
+                if "router" not in name and "lm_head" not in name:
                     nn.init.normal_(module.weight, mean=0.0, std=0.02)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
@@ -554,8 +552,27 @@ class ParvModel(nn.Module):
 
         hidden = self.token_embedding(input_ids)
 
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        is_prefill_or_training = (seq_len > 1) or (not use_kv_cache)
+
+        if self.config.n_global_tokens > 0 and is_prefill_or_training:
+            g_tokens = self.global_tokens.expand(batch_size, -1, -1).to(hidden.dtype)
+            hidden = torch.cat([g_tokens, hidden], dim=1)
+            
+            g_pos = torch.arange(self.config.n_global_tokens, device=device).unsqueeze(0).expand(batch_size, -1)
+            if position_ids is None:
+                position_ids = torch.arange(
+                    self.config.n_global_tokens, 
+                    self.config.n_global_tokens + seq_len, 
+                    device=device
+                ).unsqueeze(0).expand(batch_size, -1)
+            position_ids = torch.cat([g_pos, position_ids], dim=1)
+        else:
+            if position_ids is None:
+                if use_kv_cache:
+                    past_len = self.layers[0].self_attn.kv_cache.seq_len if self.layers[0].self_attn.kv_cache is not None else 0
+                    position_ids = torch.arange(past_len, past_len + seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+                else:
+                    position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
         total_aux_loss = hidden.new_zeros(1)
         for layer in self.layers:
@@ -595,25 +612,10 @@ class ParvModel(nn.Module):
         self.init_kv_caches(max_batch_size=batch_size)
 
         generated = input_ids.clone()
+        # Prefill: run the full prompt through the model to populate KV cache
+        out = self.forward(input_ids, position_ids=None, use_kv_cache=True, update_aux_loss=False)
+
         for _ in range(max_new_tokens):
-            if generated.size(1) > self.config.sliding_window:
-                curr_input = generated[:, -self.config.sliding_window:]
-                pos_offset = generated.size(1) - self.config.sliding_window
-            else:
-                curr_input = generated
-                pos_offset = 0
-
-            pos_ids = torch.arange(
-                pos_offset, pos_offset + curr_input.size(1),
-                device=generated.device,
-            ).unsqueeze(0).expand(batch_size, -1)
-
-            out = self.forward(
-                curr_input,
-                position_ids=pos_ids,
-                use_kv_cache=True,
-                update_aux_loss=False,
-            )
             logits = out["logits"][:, -1, :]
 
             if temperature > 0 and temperature != 1.0:
@@ -640,6 +642,13 @@ class ParvModel(nn.Module):
 
             if eos_token_id is not None and (next_token == eos_token_id).any():
                 break
+
+            out = self.forward(
+                next_token,
+                position_ids=None,
+                use_kv_cache=True,
+                update_aux_loss=False,
+            )
 
         self.clear_kv_caches()
         return generated

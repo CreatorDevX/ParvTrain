@@ -17,6 +17,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from dataset import (
     load_hastings,
@@ -48,18 +49,37 @@ def tokenize_stream_to_bin(text_paths, tokenizer, dst):
     """Tokenize files chunk-by-chunk, append tokens to a .bin file on disk.
     Peak RAM: one 64 MB text chunk + its ~14M encoded tokens (~28 MB)."""
     total = 0
+    n_files = len(text_paths)
+    file_pbar = tqdm(text_paths, desc="Files", unit="file", position=0)
     with open(dst, "wb") as out:
-        for p in text_paths:
+        for p in file_pbar:
+            fname = Path(p).name
+            file_pbar.set_postfix_str(fname)
+            file_tok = 0
+            fsize = os.path.getsize(p)
+            chunk_pbar = tqdm(
+                total=fsize, desc=f"  {fname}", unit="B", unit_scale=True,
+                leave=False, position=1,
+            )
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
                 while True:
                     text = f.read(CHUNK_SIZE)
                     if not text:
                         break
                     ids = tokenizer.enc.encode(text, allowed_special="all")
-                    ids.append(tokenizer.eos_token_id)
                     total += len(ids)
+                    file_tok += len(ids)
                     arr = np.array(ids, dtype=DTYPE)
                     out.write(arr.tobytes())
+                    chunk_pbar.update(len(text.encode("utf-8")))
+            chunk_pbar.close()
+            # Append EOS token once per file after whole-file stream completes
+            eos_arr = np.array([tokenizer.eos_token_id], dtype=DTYPE)
+            out.write(eos_arr.tobytes())
+            total += 1
+            file_tok += 1
+            tqdm.write(f"    {fname}: {file_tok:>10,} tokens")
+    tqdm.write(f"  Total: {total:,} tokens")
     return total
 
 
@@ -73,16 +93,20 @@ def split_bin(bin_path, out_dir, name="phase1"):
     data = np.memmap(bin_path, dtype=DTYPE, mode="r")
 
     shard_count = (total + SHARD_TOKENS - 1) // SHARD_TOKENS
-    for i in range(shard_count):
+    pbar = tqdm(range(shard_count), desc="Writing shards", unit="shard")
+    for i in pbar:
         start = i * SHARD_TOKENS
         end = min(start + SHARD_TOKENS, total)
         shard = data[start:end]
         shard_path = out_dir / f"{name}_{i:04d}.bin"
         shard.tofile(str(shard_path))
-        print(f"  -> {shard_path.name}  ({len(shard):,} tokens)")
+        pbar.set_postfix_str(f"{shard_path.name} ({len(shard):,} tok)")
 
+    del shard
+    if hasattr(data, "_mmap") and data._mmap is not None:
+        data._mmap.close()
     del data
-    print(f"  Total: {total:,} tokens across {shard_count} shard(s)")
+    tqdm.write(f"  Total: {total:,} tokens across {shard_count} shard(s)")
 
 
 def tokenize_to_shards(text_paths, tokenizer, out_dir, name="phase1"):
@@ -93,10 +117,11 @@ def tokenize_to_shards(text_paths, tokenizer, out_dir, name="phase1"):
         print(f"  Cache found: {len(existing)} shards, {total:,} tokens")
         return
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     tmp_bin = out_dir / f"_{name}_tmp.bin"
     print(f"  Streaming tokens to temp .bin...")
     n = tokenize_stream_to_bin(text_paths, tokenizer, str(tmp_bin))
-    print(f"    {n:,} tokens written")
+    print(f"  Total: {n:,} tokens across {len(text_paths)} files")
     split_bin(str(tmp_bin), out_dir, name=name)
     tmp_bin.unlink()
 
@@ -111,13 +136,12 @@ def upload_to_hf(local_dir, repo_id, hf_token, revision=None):
     if revision:
         kwargs["revision"] = revision
 
-    for fname in sorted(os.listdir(local_dir)):
+    files = [f for f in sorted(os.listdir(local_dir)) if (Path(local_dir) / f).is_file()]
+    for fname in tqdm(files, desc="Uploading", unit="file"):
         local = Path(local_dir) / fname
-        if local.is_file():
-            print(f"  Uploading {fname} ...")
-            api.upload_file(
-                path_or_fileobj=str(local), path_in_repo=fname, **kwargs,
-            )
+        api.upload_file(
+            path_or_fileobj=str(local), path_in_repo=fname, **kwargs,
+        )
 
     # tokenizer alongside
     tok_dir = Path(local_dir) / "_tokenizer"
@@ -132,7 +156,7 @@ def upload_to_hf(local_dir, repo_id, hf_token, revision=None):
             path_in_repo=f"_tokenizer/{fname}", **kwargs,
         )
 
-    print(f"  Done — {repo_id} (rev={revision})")
+    tqdm.write(f"  Done — {repo_id} (rev={revision})")
 
 
 if __name__ == "__main__":
@@ -155,7 +179,9 @@ if __name__ == "__main__":
 
     # ── Phase 1: Themelios-11 ──
     print("\n=== Phase 1: Themelios-11 ===")
+    print("Downloading source files...")
     local_files = download_text_files(THEMELIOS_URLS, cache_dir=str(cache / "_raw"))
+    print(f"  {len(local_files)} files cached")
     tokenize_to_shards(local_files, tokenizer, cache / "phase1", name="phase1")
 
     # ── Phase 2: Ultra-FineWeb subset (streamed to file, never in RAM) ──

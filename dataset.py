@@ -84,16 +84,23 @@ def load_hastings(pkl_path: str = "Hastings.pkl") -> TiktokenTokenizer:
 
 def tokenize_to_bin(
     text: str,
-    tokenizer: PreTrainedTokenizerFast,
+    tokenizer: Union["TiktokenTokenizer", PreTrainedTokenizerFast],
     dst: str,
     bos: bool = False,
     eos: bool = True,
 ) -> int:
-    ids = tokenizer.encode(text)
-    if bos:
-        ids = [tokenizer.bos_token_id] + ids
-    if eos:
-        ids = ids + [tokenizer.eos_token_id]
+    if isinstance(tokenizer, TiktokenTokenizer):
+        ids = tokenizer.encode(text)
+        if bos:
+            ids = [tokenizer.bos_token_id] + ids
+        if eos:
+            ids = ids + [tokenizer.eos_token_id]
+    else:
+        ids = tokenizer.encode(text)
+        if bos:
+            ids = [tokenizer.bos_token_id] + ids
+        if eos:
+            ids = ids + [tokenizer.eos_token_id]
     arr = np.array(ids, dtype=DTYPE)
     with open(dst, "wb") as f:
         f.write(arr.tobytes())
@@ -315,7 +322,7 @@ def prepare_phase1_data(
 def prepare_phase2_data(
     hf_dataset: str,
     n_samples: int,
-    tokenizer: PreTrainedTokenizerFast,
+    tokenizer: Union["TiktokenTokenizer", PreTrainedTokenizerFast],
     cache_dir: str = "data",
     text_field: str = "text",
 ) -> str:
@@ -326,7 +333,10 @@ def prepare_phase2_data(
         return str(bin_path)
 
     print(f"Loading {hf_dataset} ({n_samples} samples)...")
-    text = load_hf_dataset_subset(hf_dataset, n_samples=n_samples, text_field=text_field)
+    raw_txt = str(Path(cache_dir) / "phase2_raw.txt")
+    load_hf_dataset_to_file(hf_dataset, dst=raw_txt, n_samples=n_samples, text_field=text_field)
+    with open(raw_txt, "r", encoding="utf-8") as f:
+        text = f.read()
     print(f"  Raw text: {len(text):,} chars")
 
     tmp_dir = Path(cache_dir) / "tmp_p2"
@@ -335,6 +345,8 @@ def prepare_phase2_data(
     total = concatenate_bins([str(tmp_dir / "all.bin")], str(bin_path))
     print(f"  Tokenized: {total:,} tokens → {bin_path}")
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    if os.path.exists(raw_txt):
+        os.remove(raw_txt)
     return str(bin_path)
 
 
@@ -409,13 +421,20 @@ class MemmapDataset(Dataset):
         start = idx * self.stride
         end = start + self.seq_len
         if end > len(data):
-            chunk = np.zeros(self.seq_len, dtype=np.int64)
+            chunk = np.full(self.seq_len, 0, dtype=np.int64)
+            labels = np.full(self.seq_len, -100, dtype=np.int64)
+            mask = np.zeros(self.seq_len, dtype=np.int64)
             avail = len(data) - start
             chunk[:avail] = data[start:start+avail].astype(np.int64)
+            labels[:avail] = chunk[:avail]
+            mask[:avail] = 1
         else:
             chunk = data[start:end].astype(np.int64)
+            labels = chunk.copy()
+            mask = np.ones(self.seq_len, dtype=np.int64)
         ids = torch.from_numpy(chunk)
-        return {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones(self.seq_len, dtype=torch.long)}
+        lbl = torch.from_numpy(labels)
+        return {"input_ids": ids, "labels": lbl, "attention_mask": torch.from_numpy(mask)}
 
 
 def build_dataloader(
