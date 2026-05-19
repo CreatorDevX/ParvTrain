@@ -145,7 +145,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hastings", default="Hastings.pkl")
+    parser.add_argument("--hastings", default="Hastings.pkl", dest="hastings_path")
     parser.add_argument("--hf-token", required=True)
     parser.add_argument("--upload-repo", required=True)
     parser.add_argument("--cache-dir", default="data/tokenized_npy")
