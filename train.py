@@ -39,6 +39,12 @@ DEFAULT_DATA = [
 ]
 
 
+def _spawn_wrapper(local_rank, args):
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(os.environ["WORLD_SIZE"])
+    _train_impl(args)
+
 def train_cli(args):
     tmp.set_start_method("spawn", force=True)
     n = args.num_gpus or torch.cuda.device_count()
@@ -47,13 +53,7 @@ def train_cli(args):
     os.environ["MASTER_PORT"] = "29500"
     os.environ["WORLD_SIZE"] = str(n)
 
-    def _spawn_fn(local_rank, args):
-        os.environ["RANK"] = str(local_rank)
-        os.environ["LOCAL_RANK"] = str(local_rank)
-        os.environ["LOCAL_WORLD_SIZE"] = str(n)
-        _train_impl(args)
-
-    tmp.spawn(_spawn_fn, args=(args,), nprocs=n, join=True)
+    tmp.spawn(_spawn_wrapper, args=(args,), nprocs=n, join=True)
 
 
 def _train_impl(args):
