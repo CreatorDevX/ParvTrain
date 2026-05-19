@@ -27,6 +27,8 @@ class ParvForCausalLM(PreTrainedModel):
         use_cache: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        global_step: int = 0,
+        warmup_steps: int = 1000,
     ) -> CausalLMOutputWithPast:
         out = self.model(
             input_ids,
@@ -34,6 +36,8 @@ class ParvForCausalLM(PreTrainedModel):
             position_ids=position_ids,
             use_kv_cache=use_cache,
             update_aux_loss=labels is not None,
+            global_step=global_step,
+            warmup_steps=warmup_steps,
         )
         logits = out["logits"]
         aux_loss = out["aux_loss"]

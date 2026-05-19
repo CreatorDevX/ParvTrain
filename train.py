@@ -20,7 +20,7 @@ from dataset import (
     prepare_phase2_data,
     build_dataloader,
     load_hastings,
-    download_npy_shards,
+    download_bin_shards,
     PHASE2_CURRICULUM,
 )
 
@@ -49,8 +49,8 @@ def train_cli(args):
     if args.npy_repo:
         # Load pre-tokenized .npy shards from HF
         print(f"Downloading pre-tokenized data from {args.npy_repo} ...")
-        download_npy_shards(args.npy_repo, revision="phase1", hf_token=args.hf_token)
-        download_npy_shards(args.npy_repo, revision="phase2", hf_token=args.hf_token)
+        download_bin_shards(args.npy_repo, revision="phase1", hf_token=args.hf_token)
+        download_bin_shards(args.npy_repo, revision="phase2", hf_token=args.hf_token)
     else:
         # Tokenize from scratch
         prepare_phase1_data(args.data, tokenizer, cache_dir="data")
@@ -190,7 +190,10 @@ def _train_impl(args):
 
     p1_tok_step = p1_bs * world_size * 2048
     total_steps_p1 = math.ceil(args.total_tokens_p1 / (p1_tok_step * p1_ga))
-    total_steps_p2 = math.ceil(args.total_tokens_p2 / (p1_tok_step * p1_ga))
+    # avg seq_len across curriculum: 4096×0.5 + 8192×0.3125 + 16384×0.125 + 32768×0.0625 = 8704
+    avg_seq_p2 = 8704
+    p2_tok_step = p2_bs * world_size * avg_seq_p2
+    total_steps_p2 = math.ceil(args.total_tokens_p2 / (p2_tok_step * p2_ga))
     total_steps = total_steps_p1 + total_steps_p2
     log(f"Effective tok/step (P1): {p1_tok_step * p1_ga}")
     log(f"Steps — P1: ~{total_steps_p1}  P2: ~{total_steps_p2}  total: ~{total_steps}")
@@ -246,7 +249,7 @@ def _train_impl(args):
             for fname in os.listdir(str(td)):
                 hf_api.upload_file(path_or_fileobj=str(td / fname),
                                    path_in_repo=f"tokenizer/{fname}",
-                                   repo_id=args.model_repo, token=args.hf_token)
+                                   repo_id=args.lora_repo, token=args.hf_token)
             log("  Tokenizer pushed")
 
     def push_model():
@@ -303,7 +306,8 @@ def _train_impl(args):
             batch = next(data_iter)
 
         with accelerator.accumulate(model):
-            out = model(input_ids=batch["input_ids"], labels=batch["labels"])
+            out = model(input_ids=batch["input_ids"], labels=batch["labels"],
+                        global_step=step, warmup_steps=args.warmup_steps)
             accelerator.backward(out.loss)
             accelerator.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
@@ -314,7 +318,7 @@ def _train_impl(args):
 
             if accelerator.sync_gradients:
                 step += 1
-                tokens_seen += batch["input_ids"].numel() * world_size
+                tokens_seen += batch["input_ids"].numel() * world_size * p1_ga
                 best_loss = min(best_loss, out.loss.item())
 
                 if step % 20 == 0:
@@ -354,8 +358,11 @@ def _train_impl(args):
 
     model.train()
     p2_tokens = 0
+    p2_weight_t = torch.tensor(p2_probs)
     while p2_tokens < args.total_tokens_p2:
-        idx = random.choices(range(len(p2_curriculum)), weights=p2_probs, k=1)[0]
+        # deterministic across DDP ranks (seeded by optimizer step)
+        p2_rng = torch.Generator(device="cpu").manual_seed(42 + step * 1000003)
+        idx = torch.multinomial(p2_weight_t, 1, generator=p2_rng).item()
         spec = p2_curriculum[idx]
         try:
             batch = next(p2_iters[idx])
@@ -364,7 +371,8 @@ def _train_impl(args):
             batch = next(p2_iters[idx])
 
         with accelerator.accumulate(model):
-            out = model(input_ids=batch["input_ids"], labels=batch["labels"])
+            out = model(input_ids=batch["input_ids"], labels=batch["labels"],
+                        global_step=step, warmup_steps=args.warmup_steps)
             accelerator.backward(out.loss)
             accelerator.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
@@ -375,7 +383,7 @@ def _train_impl(args):
 
             if accelerator.sync_gradients:
                 step += 1
-                tok = batch["input_ids"].numel() * world_size
+                tok = batch["input_ids"].numel() * world_size * p2_ga
                 tokens_seen += tok
                 p2_tokens += tok
                 best_loss = min(best_loss, out.loss.item())
@@ -398,7 +406,8 @@ def _train_impl(args):
 
     log("=== Training Complete ===")
     push_model()
-    log_metrics(2, 0, out.loss.item(), {"event": "training_complete", "best_loss": best_loss})
+    final_loss = out.loss.item() if 'out' in dir() else best_loss
+    log_metrics(2, 0, final_loss, {"event": "training_complete", "best_loss": best_loss})
     accelerator.end_training()
 
 
@@ -416,6 +425,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--lora-r", type=int, default=4)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--total-tokens-p1", type=int, default=3_000_000_000)
     parser.add_argument("--total-tokens-p2", type=int, default=250_000_000)
     parser.add_argument("--merge-interval", type=int, default=100)
@@ -429,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
     parser.add_argument("--npy-repo", type=str, default=None,
-                        help="HF dataset repo with pre-tokenized .npy shards (skips local tokenization)")
+                        help="HF dataset repo with pre-tokenized .bin shards (skips local tokenization)")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 

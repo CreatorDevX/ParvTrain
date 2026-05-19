@@ -1,6 +1,6 @@
 """
-Standalone script: tokenize the entire Themelios-11 corpus + Ultra-FineWeb subset
-and upload as .npy files to Hugging Face Datasets.
+Standalone script: tokenize corpus → .npy shards → upload to HF Datasets.
+Zero OOM — tokens stream to disk, never accumulate in RAM.
 
 Usage:
   python tokenize_dataset.py \
@@ -11,21 +11,17 @@ Usage:
 """
 
 import os
-import sys
-import math
 import json
 import pickle
 import shutil
 from pathlib import Path
 
 import numpy as np
-from tqdm import tqdm
 
 from dataset import (
     load_hastings,
-    resolve_sources,
     download_text_files,
-    load_hf_dataset_subset,
+    load_hf_dataset_to_file,
     DTYPE,
 )
 
@@ -44,64 +40,65 @@ THEMELIOS_URLS = [
     "https://huggingface.co/datasets/CreatorDevX/Themelios-11/resolve/main/wikidata5m_text.txt",
 ]
 
-CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB text chunks
-NPY_MAX_BYTES = 2 * 1024**3    # 2 GB per .npy shard
+CHUNK_SIZE = 64 * 1024 * 1024      # 64 MB text chunks
+SHARD_TOKENS = 500_000_000         # 500M tokens per .npy shard (~1 GB as uint16)
 
 
-def tokenize_to_npy_shards(
-    text_paths,
-    tokenizer,
-    out_dir,
-    name="phase1",
-    skip_if_exists=False,
-):
-    """Tokenize files and write to 2 GB .npy shards."""
+def tokenize_stream_to_bin(text_paths, tokenizer, dst):
+    """Tokenize files chunk-by-chunk, append tokens to a .bin file on disk.
+    Peak RAM: one 64 MB text chunk + its ~14M encoded tokens (~28 MB)."""
+    total = 0
+    with open(dst, "wb") as out:
+        for p in text_paths:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                while True:
+                    text = f.read(CHUNK_SIZE)
+                    if not text:
+                        break
+                    ids = tokenizer.enc.encode(text, allowed_special="all")
+                    ids.append(tokenizer.eos_token_id)
+                    total += len(ids)
+                    arr = np.array(ids, dtype=DTYPE)
+                    out.write(arr.tobytes())
+    return total
+
+
+def split_bin(bin_path, out_dir, name="phase1"):
+    """Split a .bin file into SHARD_TOKENS-sized .bin shards via memmap.
+    Peak RAM: negligible."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if skip_if_exists and list(out_dir.glob(f"{name}_*.npy")):
-        npy_paths = sorted(out_dir.glob(f"{name}_*.npy"))
-        total = sum(np.load(p, mmap_mode="r").size for p in npy_paths)
-        print(f"  Cache found: {len(npy_paths)} shards, {total:,} tokens")
+    total = os.path.getsize(bin_path) // DTYPE().itemsize
+    data = np.memmap(bin_path, dtype=DTYPE, mode="r")
+
+    shard_count = (total + SHARD_TOKENS - 1) // SHARD_TOKENS
+    for i in range(shard_count):
+        start = i * SHARD_TOKENS
+        end = min(start + SHARD_TOKENS, total)
+        shard = data[start:end]
+        shard_path = out_dir / f"{name}_{i:04d}.bin"
+        shard.tofile(str(shard_path))
+        print(f"  -> {shard_path.name}  ({len(shard):,} tokens)")
+
+    del data
+    print(f"  Total: {total:,} tokens across {shard_count} shard(s)")
+
+
+def tokenize_to_shards(text_paths, tokenizer, out_dir, name="phase1"):
+    out_dir = Path(out_dir)
+    existing = sorted(out_dir.glob(f"{name}_*.bin"))
+    if existing:
+        total = sum(os.path.getsize(p) // DTYPE().itemsize for p in existing)
+        print(f"  Cache found: {len(existing)} shards, {total:,} tokens")
         return
 
-    print(f"Tokenizing {len(text_paths)} files...")
-    shard_idx = 0
-    shard_buffer = []
-    shard_bytes = 0
-    total_tokens = 0
-
-    for p in text_paths:
-        fname = Path(p).name
-        print(f"  {fname} ...")
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                ids = tokenizer.enc.encode(chunk, allowed_special="all")
-                ids.append(tokenizer.eos_token_id)
-                shard_buffer.extend(ids)
-                shard_bytes += len(ids) * 2  # uint16 bytes
-                total_tokens += len(ids)
-
-                if shard_bytes >= NPY_MAX_BYTES:
-                    arr = np.array(shard_buffer, dtype=DTYPE)
-                    npy_path = out_dir / f"{name}_{shard_idx:04d}.npy"
-                    np.save(npy_path, arr)
-                    print(f"    -> {npy_path.name}  ({len(arr):,} tokens)")
-                    shard_buffer = []
-                    shard_bytes = 0
-                    shard_idx += 1
-
-    # flush remainder
-    if shard_buffer:
-        arr = np.array(shard_buffer, dtype=DTYPE)
-        npy_path = out_dir / f"{name}_{shard_idx:04d}.npy"
-        np.save(npy_path, arr)
-        print(f"    -> {npy_path.name}  ({len(arr):,} tokens)")
-
-    print(f"  Total: {total_tokens:,} tokens across {shard_idx + 1} shards")
+    tmp_bin = out_dir / f"_{name}_tmp.bin"
+    print(f"  Streaming tokens to temp .bin...")
+    n = tokenize_stream_to_bin(text_paths, tokenizer, str(tmp_bin))
+    print(f"    {n:,} tokens written")
+    split_bin(str(tmp_bin), out_dir, name=name)
+    tmp_bin.unlink()
 
 
 def upload_to_hf(local_dir, repo_id, hf_token, revision=None):
@@ -119,12 +116,10 @@ def upload_to_hf(local_dir, repo_id, hf_token, revision=None):
         if local.is_file():
             print(f"  Uploading {fname} ...")
             api.upload_file(
-                path_or_fileobj=str(local),
-                path_in_repo=fname,
-                **kwargs,
+                path_or_fileobj=str(local), path_in_repo=fname, **kwargs,
             )
 
-    # also upload tokenizer
+    # tokenizer alongside
     tok_dir = Path(local_dir) / "_tokenizer"
     tok_dir.mkdir(exist_ok=True)
     with open(tok_dir / "tokenizer.pkl", "wb") as f:
@@ -134,11 +129,10 @@ def upload_to_hf(local_dir, repo_id, hf_token, revision=None):
     for fname in os.listdir(str(tok_dir)):
         api.upload_file(
             path_or_fileobj=str(tok_dir / fname),
-            path_in_repo=f"_tokenizer/{fname}",
-            **kwargs,
+            path_in_repo=f"_tokenizer/{fname}", **kwargs,
         )
 
-    print(f"Done — uploaded to {repo_id}")
+    print(f"  Done — {repo_id} (rev={revision})")
 
 
 if __name__ == "__main__":
@@ -162,19 +156,20 @@ if __name__ == "__main__":
     # ── Phase 1: Themelios-11 ──
     print("\n=== Phase 1: Themelios-11 ===")
     local_files = download_text_files(THEMELIOS_URLS, cache_dir=str(cache / "_raw"))
-    tokenize_to_npy_shards(local_files, tokenizer, cache / "phase1", name="phase1")
+    tokenize_to_shards(local_files, tokenizer, cache / "phase1", name="phase1")
 
-    # ── Phase 2: Ultra-FineWeb subset ──
+    # ── Phase 2: Ultra-FineWeb subset (streamed to file, never in RAM) ──
     print("\n=== Phase 2: Ultra-FineWeb ===")
-    text = load_hf_dataset_subset("openbmb/Ultra-FineWeb", n_samples=args.phase2_samples)
-    tmp_path = cache / "_tmp_ultra.txt"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    tokenize_to_npy_shards([str(tmp_path)], tokenizer, cache / "phase2", name="phase2")
-    os.remove(tmp_path)
+    tmp_txt = cache / "_ultra_temp.txt"
+    load_hf_dataset_to_file(
+        "openbmb/Ultra-FineWeb", dst=str(tmp_txt),
+        n_samples=args.phase2_samples,
+    )
+    tokenize_to_shards([str(tmp_txt)], tokenizer, cache / "phase2", name="phase2")
+    tmp_txt.unlink()
 
     # ── Upload ──
     if not args.skip_upload:
-        print(f"\n=== Uploading to {args.upload_repo} ===")
+        print("\n=== Uploading ===")
         upload_to_hf(cache / "phase1", args.upload_repo, args.hf_token, revision="phase1")
         upload_to_hf(cache / "phase2", args.upload_repo, args.hf_token, revision="phase2")
