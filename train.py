@@ -2,6 +2,7 @@ import os
 import math
 import random
 import shutil
+import multiprocessing as mp
 from pathlib import Path
 from typing import List, Optional
 
@@ -39,11 +40,14 @@ DEFAULT_DATA = [
 
 
 def train_cli(args):
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     notebook_launcher(
         _train_impl,
         (args,),
         num_processes=args.num_gpus,
-        start_method="spawn",
     )
 
 
