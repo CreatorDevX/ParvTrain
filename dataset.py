@@ -2,6 +2,7 @@ import io
 import os
 import math
 import json
+import pickle
 import random
 import shutil
 import struct
@@ -17,6 +18,63 @@ from transformers import PreTrainedTokenizerFast
 
 
 DTYPE = np.uint16
+
+
+class TiktokenTokenizer:
+    def __init__(self, enc, bos_token="<|endoftext|>", eos_token="<|endoftext|>", pad_token="<|pad|>"):
+        self.enc = enc
+        self._bos = bos_token
+        self._eos = eos_token
+        self._pad = pad_token
+        self.vocab_size = enc.n_vocab
+        self.bos_token_id = enc.encode_single_token(bos_token) if bos_token in enc.special_tokens_set else 0
+        self.eos_token_id = enc.encode_single_token(eos_token) if eos_token in enc.special_tokens_set else 1
+        self.pad_token_id = enc.encode_single_token(pad_token) if pad_token in enc.special_tokens_set else 2
+        self.bos_token = bos_token
+        self.eos_token = eos_token
+        self.pad_token = pad_token
+        self.special_tokens_set = enc.special_tokens_set
+
+    def encode(self, text: str) -> List[int]:
+        return self.enc.encode(text, allowed_special="all")
+
+    def decode(self, ids: List[int]) -> str:
+        return self.enc.decode(ids)
+
+    def save_pretrained(self, path: str):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        with open(path / "tokenizer.pkl", "wb") as f:
+            pickle.dump(self.enc, f)
+        info = {
+            "bos_token": self._bos,
+            "eos_token": self._eos,
+            "pad_token": self._pad,
+            "vocab_size": self.vocab_size,
+        }
+        with open(path / "tokenizer_info.json", "w") as f:
+            json.dump(info, f)
+
+    @staticmethod
+    def from_pretrained(path: str):
+        path = Path(path)
+        with open(path / "tokenizer.pkl", "rb") as f:
+            enc = pickle.load(f)
+        info_path = path / "tokenizer_info.json"
+        if info_path.exists():
+            with open(info_path) as f:
+                info = json.load(f)
+            return TiktokenTokenizer(enc, info["bos_token"], info["eos_token"], info["pad_token"])
+        return TiktokenTokenizer(enc)
+
+
+def load_hastings(pkl_path: str = "Hastings.pkl") -> TiktokenTokenizer:
+    import tiktoken
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+    name = data.pop("name")
+    enc = tiktoken.core.Encoding(name=name, **data)
+    return TiktokenTokenizer(enc)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +226,19 @@ def load_or_train_tokenizer(
             eos_token="<|endoftext|>",
             pad_token="<|pad|>",
         )
+    print("=" * 60)
+    print("  BPE tokenizer training (first run only)")
+    print(f"  Corpus: {len(text_paths)} files, ~12 GB")
+    print("  This takes ~1 hour — it only happens once.")
+    print("=" * 60)
+    resolve_sources(text_paths, cache_dir="data/raw")
+    train_tokenizer(_stream_lines(text_paths), vocab_size=vocab_size, save_path=tokenizer_path)
+    return PreTrainedTokenizerFast(
+        tokenizer_file=tokenizer_path,
+        bos_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+        pad_token="<|pad|>",
+    )
     print("Downloading data for tokenizer training...")
     # stream through files line-by-line for BPE training (no full load)
     resolve_sources(text_paths, cache_dir="data/raw")

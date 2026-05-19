@@ -19,7 +19,7 @@ from dataset import (
     prepare_phase1_data,
     prepare_phase2_data,
     build_dataloader,
-    load_or_train_tokenizer,
+    load_hastings,
     PHASE2_CURRICULUM,
 )
 
@@ -86,10 +86,12 @@ def _train_impl(args):
     log(f"  Phase 2:  batch/GPU={p2_bs}  grad_accum={p2_ga}  effective={eff_p2}")
 
     # ── wandb init ──
-    run_name = args.wandb_name or f"parv-{os.path.splitext(os.path.basename(args.tokenizer_path))[0]}"
+    run_name = args.wandb_name or "parv-hastings"
     accelerator.init_trackers(
         project_name=args.wandb_project,
         config={
+            "tokenizer": "Hastings",
+            "tokenizer_vocab": tokenizer.vocab_size,
             "lora_r": args.lora_r,
             "p1_batch_per_gpu": p1_bs,
             "p1_grad_accum": p1_ga,
@@ -120,13 +122,13 @@ def _train_impl(args):
         init_kwargs={"wandb": {"name": run_name, "dir": args.checkpoint_dir}} if is_main else None,
     )
 
-    # ── tokenizer ──
-    log(f"Tokenizer: {args.tokenizer_path}")
-    tokenizer = load_or_train_tokenizer(
-        args.data,
-        vocab_size=ModelConfig().vocab_size,
-        tokenizer_path=args.tokenizer_path,
-    )
+    # ── tokenizer (load Hastings tiktoken, rank 0 only, then sync) ──
+    log(f"Tokenizing with Hastings ({args.hastings_path})")
+    if is_main:
+        load_hastings(args.hastings_path)  # triggers download/cache on main
+    if world_size > 1:
+        torch.distributed.barrier()
+    tokenizer = load_hastings(args.hastings_path)
 
     # ── pre-tokenize phase 1 → memmap ──
     if is_main:
@@ -138,8 +140,11 @@ def _train_impl(args):
     # ── model ──
     log("Creating model...")
     mc = ModelConfig()
+    # override vocab from tokenizer
+    actual_vocab = tokenizer.vocab_size
+    log(f"  vocab_size: {actual_vocab} (from Hastings)")
     hf_config = ParvHFConfig(
-        vocab_size=mc.vocab_size, d_model=mc.d_model, n_layers=mc.n_layers,
+        vocab_size=actual_vocab, d_model=mc.d_model, n_layers=mc.n_layers,
         n_moe_layers=mc.n_moe_layers, n_dense_layers=mc.n_dense_layers,
         n_heads=mc.n_heads, n_kv_heads=mc.n_kv_heads, d_head=mc.d_head,
         d_ff=mc.d_ff, activation=mc.activation, rope_base=mc.rope_base,
@@ -409,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-repo", type=str, default=None)
     parser.add_argument("--hf-token", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--tokenizer-path", type=str, default="data/tokenizer.json")
+    parser.add_argument("--hastings-path", type=str, default="Hastings.pkl")
     parser.add_argument("--wandb-project", type=str, default="parv")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
