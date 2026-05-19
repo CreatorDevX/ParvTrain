@@ -130,7 +130,7 @@ def load_hf_dataset_subset(
 # ---------------------------------------------------------------------------
 
 def train_tokenizer(
-    corpus: str,
+    corpus_iterator,
     vocab_size: int = 32000,
     save_path: str = "data/tokenizer.json",
 ):
@@ -142,9 +142,18 @@ def train_tokenizer(
         special_tokens=["<|endoftext|>", "<|pad|>"],
         min_frequency=2,
     )
-    tokenizer.train_from_iterator(corpus.split("\n"), trainer)
+    tokenizer.train_from_iterator(corpus_iterator, trainer)
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(save_path)
+
+
+def _stream_lines(sources: List[str], cache_dir: str = "data/raw"):
+    """Yield lines from all sources one by one (never loads everything)."""
+    paths = resolve_sources(sources, cache_dir)
+    for p in paths:
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                yield line
 
 
 def load_or_train_tokenizer(
@@ -160,9 +169,9 @@ def load_or_train_tokenizer(
             pad_token="<|pad|>",
         )
     print("Downloading data for tokenizer training...")
-    corpus = download_and_load_text(text_paths, cache_dir="data/raw")
-    print(f"  Raw text: {len(corpus):,} chars")
-    train_tokenizer(corpus, vocab_size=vocab_size, save_path=tokenizer_path)
+    # stream through files line-by-line for BPE training (no full load)
+    resolve_sources(text_paths, cache_dir="data/raw")
+    train_tokenizer(_stream_lines(text_paths), vocab_size=vocab_size, save_path=tokenizer_path)
     return PreTrainedTokenizerFast(
         tokenizer_file=tokenizer_path,
         bos_token="<|endoftext|>",
@@ -187,20 +196,28 @@ def prepare_phase1_data(
         return str(bin_path)
 
     print("Downloading phase 1 data...")
-    text = download_and_load_text(data_paths, cache_dir=os.path.join(cache_dir, "raw"))
-    print(f"  Raw text: {len(text):,} chars")
+    resolved = resolve_sources(data_paths, cache_dir=os.path.join(cache_dir, "raw"))
 
-    print("Tokenizing phase 1 data (entire corpus)...")
+    # Tokenize each file separately, collecting per-file bin paths
     tmp_dir = Path(cache_dir) / "tmp_p1"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    n_tok = tokenize_to_bin(text, tokenizer, str(tmp_dir / "all.bin"), eos=True)
-    print(f"  Tokenized: {n_tok:,} tokens total across all documents")
-    # free text from memory
-    del text
+    shard_bins = []
+    total_tokens = 0
+    for i, path in enumerate(resolved):
+        print(f"  Tokenizing [{i+1}/{len(resolved)}] {Path(path).name}...")
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        shard = str(tmp_dir / f"shard_{i}.bin")
+        n = tokenize_to_bin(text, tokenizer, shard, eos=True)
+        total_tokens += n
+        shard_bins.append(shard)
+        del text  # free per-file memory
+        print(f"    {n:,} tokens")
 
-    total = concatenate_bins([str(tmp_dir / "all.bin")], str(bin_path))
-    print(f"  Saved to {bin_path} ({total:,} tokens)")
+    print(f"  Total across all files: {total_tokens:,} tokens")
+    concatenate_bins(shard_bins, str(bin_path))
+    print(f"  Saved to {bin_path}")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return str(bin_path)
 
