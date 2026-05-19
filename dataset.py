@@ -7,6 +7,7 @@ import random
 import shutil
 import struct
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Dict, Iterator, Union, Tuple
 
@@ -257,7 +258,7 @@ def load_or_train_tokenizer(
 
 def prepare_phase1_data(
     data_paths: List[str],
-    tokenizer: PreTrainedTokenizerFast,
+    tokenizer: "TiktokenTokenizer",
     cache_dir: str = "data",
 ) -> str:
     bin_path = Path(cache_dir) / "phase1.bin"
@@ -269,22 +270,34 @@ def prepare_phase1_data(
     print("Downloading phase 1 data...")
     resolved = resolve_sources(data_paths, cache_dir=os.path.join(cache_dir, "raw"))
 
-    # Tokenize each file separately, collecting per-file bin paths
     tmp_dir = Path(cache_dir) / "tmp_p1"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    shard_bins = []
-    total_tokens = 0
-    for i, path in enumerate(resolved):
-        print(f"  Tokenizing [{i+1}/{len(resolved)}] {Path(path).name}...")
+    def _tokenize_one(path_idx):
+        path, i = path_idx
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
         shard = str(tmp_dir / f"shard_{i}.bin")
-        n = tokenize_to_bin(text, tokenizer, shard, eos=True)
-        total_tokens += n
-        shard_bins.append(shard)
-        del text  # free per-file memory
-        print(f"    {n:,} tokens")
+        # tiktoken.encode releases GIL — threads run in parallel
+        ids = tokenizer.enc.encode(text, allowed_special="all")
+        ids.append(tokenizer.eos_token_id)
+        arr = np.array(ids, dtype=np.uint16)
+        arr.tofile(shard)
+        return shard, len(ids), Path(path).name
+
+    n_workers = min(len(resolved), os.cpu_count() or 4)
+    print(f"  Tokenizing {len(resolved)} files with {n_workers} threads...")
+    shard_bins = [None] * len(resolved)
+    total_tokens = 0
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        fut_map = {pool.submit(_tokenize_one, (p, i)): i for i, p in enumerate(resolved)}
+        for fut in as_completed(fut_map):
+            i = fut_map[fut]
+            shard, n, name = fut.result()
+            shard_bins[i] = shard
+            total_tokens += n
+            print(f"    [{i+1}/{len(resolved)}] {name}: {n:,} tokens")
 
     print(f"  Total across all files: {total_tokens:,} tokens")
     concatenate_bins(shard_bins, str(bin_path))

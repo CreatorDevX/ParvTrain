@@ -85,6 +85,15 @@ def _train_impl(args):
     log(f"  Phase 1:  batch/GPU={p1_bs}  grad_accum={p1_ga}  effective={eff_p1}")
     log(f"  Phase 2:  batch/GPU={p2_bs}  grad_accum={p2_ga}  effective={eff_p2}")
 
+    # ── tokenizer (load Hastings tiktoken, rank 0 only, then sync) ──
+    log(f"Loading tokenizer from {args.hastings_path}")
+    if is_main:
+        load_hastings(args.hastings_path)
+    if world_size > 1:
+        torch.distributed.barrier()
+    tokenizer = load_hastings(args.hastings_path)
+    log(f"  vocab_size={tokenizer.vocab_size}")
+
     # ── wandb init ──
     run_name = args.wandb_name or "parv-hastings"
     accelerator.init_trackers(
@@ -121,14 +130,6 @@ def _train_impl(args):
         },
         init_kwargs={"wandb": {"name": run_name, "dir": args.checkpoint_dir}} if is_main else None,
     )
-
-    # ── tokenizer (load Hastings tiktoken, rank 0 only, then sync) ──
-    log(f"Tokenizing with Hastings ({args.hastings_path})")
-    if is_main:
-        load_hastings(args.hastings_path)  # triggers download/cache on main
-    if world_size > 1:
-        torch.distributed.barrier()
-    tokenizer = load_hastings(args.hastings_path)
 
     # ── pre-tokenize phase 1 → memmap ──
     if is_main:
