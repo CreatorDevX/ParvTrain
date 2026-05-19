@@ -60,7 +60,7 @@ def _train_impl(args):
     if args.wandb_key:
         os.environ["WANDB_API_KEY"] = args.wandb_key
 
-    ga_plugin = GradientAccumulationPlugin(num_steps=args.grad_accum)
+    ga_plugin = GradientAccumulationPlugin(num_steps=args.grad_accum_p1)
     accelerator = Accelerator(
         log_with="wandb",
         gradient_accumulation_plugin=ga_plugin,
@@ -69,15 +69,21 @@ def _train_impl(args):
     world_size = accelerator.num_processes
     is_main = accelerator.is_main_process
 
-    eff_bs = args.batch_size * world_size * args.grad_accum
+    p1_bs = args.batch_size_p1
+    p1_ga = args.grad_accum_p1
+    p2_bs = args.batch_size_p2
+    p2_ga = args.grad_accum_p2
+    eff_p1 = p1_bs * world_size * p1_ga
+    eff_p2 = p2_bs * world_size * p2_ga
 
     def log(msg):
         if is_main:
             accelerator.print(msg)
 
     log("=== Parv Training ===")
-    log(f"  GPUs: {world_size}  |  batch/GPU: {args.batch_size}  (total/step: {args.batch_size * world_size})")
-    log(f"  grad_accum: {args.grad_accum}  |  effective batch: {eff_bs}")
+    log(f"  GPUs: {world_size}")
+    log(f"  Phase 1:  batch/GPU={p1_bs}  grad_accum={p1_ga}  effective={eff_p1}")
+    log(f"  Phase 2:  batch/GPU={p2_bs}  grad_accum={p2_ga}  effective={eff_p2}")
 
     # ── wandb init ──
     run_name = args.wandb_name or f"parv-{os.path.splitext(os.path.basename(args.tokenizer_path))[0]}"
@@ -85,9 +91,12 @@ def _train_impl(args):
         project_name=args.wandb_project,
         config={
             "lora_r": args.lora_r,
-            "batch_per_gpu": args.batch_size,
-            "effective_batch": eff_bs,
-            "grad_accum": args.grad_accum,
+            "p1_batch_per_gpu": p1_bs,
+            "p1_grad_accum": p1_ga,
+            "p1_effective": eff_p1,
+            "p2_batch_per_gpu": p2_bs,
+            "p2_grad_accum": p2_ga,
+            "p2_effective": eff_p2,
             "lr": args.lr,
             "total_tokens_p1": args.total_tokens_p1,
             "total_tokens_p2": args.total_tokens_p2,
@@ -154,15 +163,15 @@ def _train_impl(args):
 
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
-        phase1_bin, seq_len=2048, batch_size=args.batch_size, stride=512,
+        phase1_bin, seq_len=2048, batch_size=p1_bs, stride=512,
         num_workers=args.num_workers,
     )
 
-    tokens_per_step = args.batch_size * world_size * 2048
-    total_steps_p1 = math.ceil(args.total_tokens_p1 / (tokens_per_step * args.grad_accum))
-    total_steps_p2 = math.ceil(args.total_tokens_p2 / (tokens_per_step * args.grad_accum))
+    p1_tok_step = p1_bs * world_size * 2048
+    total_steps_p1 = math.ceil(args.total_tokens_p1 / (p1_tok_step * p1_ga))
+    total_steps_p2 = math.ceil(args.total_tokens_p2 / (p1_tok_step * p1_ga))
     total_steps = total_steps_p1 + total_steps_p2
-    log(f"Effective tok/step: {tokens_per_step * args.grad_accum}")
+    log(f"Effective tok/step (P1): {p1_tok_step * p1_ga}")
     log(f"Steps — P1: ~{total_steps_p1}  P2: ~{total_steps_p2}  total: ~{total_steps}")
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -235,13 +244,16 @@ def _train_impl(args):
     def log_metrics(phase, seq_len, loss_val, extra=None):
         if not is_main:
             return
+        bs = p1_bs if phase == 1 else p2_bs
+        ga = p1_ga if phase == 1 else p2_ga
+        raw = bs * world_size * seq_len
         metrics = {
             "loss": loss_val,
             "phase": phase,
             "seq_len": seq_len,
             "tokens": tokens_seen,
-            "tok/step": tokens_per_step if phase == 1 else (args.batch_size * world_size * seq_len),
-            "tok/step_eff": (tokens_per_step if phase == 1 else (args.batch_size * world_size * seq_len)) * args.grad_accum,
+            "tok/step": raw,
+            "tok/step_eff": raw * ga,
             "step": step,
             "lr": scheduler.get_last_lr()[0],
         }
@@ -262,7 +274,7 @@ def _train_impl(args):
             batch = next(data_iter)
         except StopIteration:
             dataloader = build_dataloader(
-                phase1_bin, seq_len=2048, batch_size=args.batch_size, stride=512,
+                phase1_bin, seq_len=2048, batch_size=p1_bs, stride=512,
                 num_workers=args.num_workers,
             )
             dataloader = accelerator.prepare(dataloader)
@@ -304,6 +316,8 @@ def _train_impl(args):
     # Phase 2  (Ultra-FineWeb curriculum)
     # ==================================================================
     log("=== Phase 2: Long-Context Curriculum ===")
+    # switch grad accum for phase 2
+    accelerator.gradient_accumulation_plugin.num_steps = p2_ga
 
     if is_main:
         prepare_phase2_data(args.hf_dataset_p2, args.n_samples_p2, tokenizer, cache_dir="data")
@@ -317,7 +331,7 @@ def _train_impl(args):
     p2_loaders, p2_iters = [], []
     for spec in p2_curriculum:
         loader = build_dataloader(phase2_bin, seq_len=spec.seq_len,
-                                  batch_size=args.batch_size, stride=512,
+                                  batch_size=p2_bs, stride=512,
                                   num_workers=args.num_workers)
         loader = accelerator.prepare(loader)
         p2_loaders.append(loader)
@@ -380,8 +394,10 @@ if __name__ == "__main__":
     parser.add_argument("--hf-dataset-p2", default="openbmb/Ultra-FineWeb")
     parser.add_argument("--n-samples-p2", type=int, default=50_000)
     parser.add_argument("--num-gpus", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=32, help="per GPU")
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--batch-size-p1", type=int, default=32, help="per GPU, phase 1")
+    parser.add_argument("--grad-accum-p1", type=int, default=4)
+    parser.add_argument("--batch-size-p2", type=int, default=2, help="per GPU, phase 2")
+    parser.add_argument("--grad-accum-p2", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--lora-r", type=int, default=4)

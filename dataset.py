@@ -80,12 +80,30 @@ def download_text_files(urls: List[str], cache_dir: str = "data/raw") -> List[st
     return paths
 
 
+def resolve_sources(sources: List[str], cache_dir: str = "data/raw") -> List[str]:
+    local = []
+    to_dl = []
+    for s in sources:
+        if s.startswith(("http://", "https://")):
+            to_dl.append(s)
+        else:
+            local.append(s)
+    if to_dl:
+        local.extend(download_text_files(to_dl, cache_dir))
+    return local
+
+
 def load_text_files(paths: List[str]) -> str:
     texts = []
     for p in paths:
         with open(p, "r", encoding="utf-8", errors="ignore") as f:
             texts.append(f.read())
     return "\n\n".join(texts)
+
+
+def download_and_load_text(sources: List[str], cache_dir: str = "data/raw") -> str:
+    paths = resolve_sources(sources, cache_dir)
+    return load_text_files(paths)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +159,9 @@ def load_or_train_tokenizer(
             eos_token="<|endoftext|>",
             pad_token="<|pad|>",
         )
-    corpus = load_text_files(text_paths)
+    print("Downloading data for tokenizer training...")
+    corpus = download_and_load_text(text_paths, cache_dir="data/raw")
+    print(f"  Raw text: {len(corpus):,} chars")
     train_tokenizer(corpus, vocab_size=vocab_size, save_path=tokenizer_path)
     return PreTrainedTokenizerFast(
         tokenizer_file=tokenizer_path,
@@ -166,13 +186,18 @@ def prepare_phase1_data(
         print(f"Phase 1 cache found: {bin_path} ({n:,} tokens)")
         return str(bin_path)
 
-    print("Tokenizing phase 1 data...")
+    print("Downloading phase 1 data...")
+    text = download_and_load_text(data_paths, cache_dir=os.path.join(cache_dir, "raw"))
+    print(f"  Raw text: {len(text):,} chars")
+
+    print("Tokenizing phase 1 data (entire corpus)...")
     tmp_dir = Path(cache_dir) / "tmp_p1"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    text = load_text_files(data_paths)
     n_tok = tokenize_to_bin(text, tokenizer, str(tmp_dir / "all.bin"), eos=True)
-    print(f"  Tokenized: {n_tok:,} tokens")
+    print(f"  Tokenized: {n_tok:,} tokens total across all documents")
+    # free text from memory
+    del text
 
     total = concatenate_bins([str(tmp_dir / "all.bin")], str(bin_path))
     print(f"  Saved to {bin_path} ({total:,} tokens)")
