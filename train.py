@@ -283,8 +283,7 @@ def _train_impl(args):
         if is_main and hf_api:
             short_bucket_name = bucket_name.split("/")[-1]
             try:
-                from huggingface_hub import create_bucket
-                create_bucket(short_bucket_name, exist_ok=True, token=args.hf_token)
+                hf_api.create_bucket(bucket_name=short_bucket_name, exist_ok=True)
                 log(f"HF Bucket ready: {bucket_name}")
             except Exception as e:
                 log(f"HF Bucket warning during creation: {e}")
@@ -323,6 +322,11 @@ def _train_impl(args):
         tokens_seen = state["tokens_seen"]
         log(f"  step={step}  tokens={tokens_seen:,}")
 
+    pbar = None
+    if is_main:
+        from tqdm.auto import tqdm
+        pbar = tqdm(total=total_steps, initial=step, desc="Training Progress")
+
     def save_ckpt():
         if not is_main:
             return
@@ -332,17 +336,16 @@ def _train_impl(args):
 
         if args.hf_bucket:
             try:
-                from huggingface_hub import batch_bucket_files
+                api = hf_api if hf_api is not None else HfApi(token=args.hf_token)
                 files_to_upload = []
                 for p in ckpt_dir.iterdir():
                     if p.is_file():
                         files_to_upload.append((str(p), f"latest/{p.name}"))
                 if files_to_upload:
                     log(f"Uploading {len(files_to_upload)} files to HF Bucket {bucket_name}...")
-                    batch_bucket_files(
-                        bucket_name,
+                    api.batch_bucket_files(
+                        bucket_name=bucket_name,
                         add=files_to_upload,
-                        token=args.hf_token
                     )
                     log("HF Bucket upload complete.")
             except Exception as e:
@@ -494,6 +497,9 @@ def _train_impl(args):
     data_iter = iter(dataloader)
     best_loss = float("inf")
     tokens_seen = 0
+    import time
+    last_time = time.time()
+    last_tokens = tokens_seen
 
     while tokens_seen < args.total_tokens_p1:
         try:
@@ -537,12 +543,31 @@ def _train_impl(args):
                 step += 1
                 scheduler.step()
                 tokens_seen += batch["input_ids"].numel() * world_size * p1_ga
+                if pbar is not None:
+                    pbar.update(1)
 
                 if step % 20 == 0:
                     loss_val = out.loss.item()
                     best_loss = min(best_loss, loss_val)
-                    log(f"  P1 step={step:>6}  tok={tokens_seen:>10,}  loss={loss_val:.4f}")
+                    
+                    current_time = time.time()
+                    elapsed_seconds = current_time - last_time
+                    tokens_delta = tokens_seen - last_tokens
+                    tokens_per_sec = tokens_delta / max(1e-6, elapsed_seconds)
+                    sec_per_20 = elapsed_seconds
+                    
+                    log(f"  P1 step={step:>6}  tok={tokens_seen:>10,}  loss={loss_val:.4f}  tok/s={tokens_per_sec:.1f}  sec/20_steps={sec_per_20:.2f}s")
                     log_metrics(1, 1024, loss_val)
+                    
+                    if pbar is not None:
+                        pbar.set_postfix({
+                            "loss": f"{loss_val:.4f}",
+                            "tok/s": f"{tokens_per_sec:.1f}",
+                            "sec/20": f"{sec_per_20:.1f}s"
+                        })
+                    
+                    last_time = current_time
+                    last_tokens = tokens_seen
 
                 if step % 100 == 0:
                     val_loss = run_validation(1)
@@ -649,12 +674,31 @@ def _train_impl(args):
                 tok = batch["input_ids"].numel() * world_size * p2_ga
                 tokens_seen += tok
                 p2_tokens += tok
+                if pbar is not None:
+                    pbar.update(1)
 
                 if step % 20 == 0:
                     loss_val = out.loss.item()
                     best_loss = min(best_loss, loss_val)
-                    log(f"  P2 step={step:>6}  tok={tokens_seen:>10,}  seq={spec.seq_len}  loss={loss_val:.4f}")
+                    
+                    current_time = time.time()
+                    elapsed_seconds = current_time - last_time
+                    tokens_delta = tokens_seen - last_tokens
+                    tokens_per_sec = tokens_delta / max(1e-6, elapsed_seconds)
+                    sec_per_20 = elapsed_seconds
+                    
+                    log(f"  P2 step={step:>6}  tok={tokens_seen:>10,}  seq={spec.seq_len}  loss={loss_val:.4f}  tok/s={tokens_per_sec:.1f}  sec/20_steps={sec_per_20:.2f}s")
                     log_metrics(2, spec.seq_len, loss_val)
+                    
+                    if pbar is not None:
+                        pbar.set_postfix({
+                            "loss": f"{loss_val:.4f}",
+                            "tok/s": f"{tokens_per_sec:.1f}",
+                            "sec/20": f"{sec_per_20:.1f}s"
+                        })
+                    
+                    last_time = current_time
+                    last_tokens = tokens_seen
 
                 if step % 100 == 0:
                     val_loss = run_validation(2)
@@ -683,6 +727,9 @@ def _train_impl(args):
                     push_model()
                     loss_val = out.loss.item()
                     log_metrics(2, spec.seq_len, loss_val, {"event": "model_push"})
+
+    if pbar is not None:
+        pbar.close()
 
     log("=== Training Complete ===")
     push_model()
