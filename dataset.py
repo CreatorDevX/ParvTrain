@@ -372,12 +372,14 @@ def download_bin_shards(
     revision: str = "phase1",
     cache_dir: str = "data",
     hf_token: Optional[str] = None,
+    out_name: Optional[str] = None,
 ) -> str:
     """Download .bin shards from a HF dataset repo and merge into a single .bin."""
     from huggingface_hub import HfApi, hf_hub_download
 
-    bin_path = Path(cache_dir) / f"{revision}.bin"
-    done_flag = Path(cache_dir) / f".{revision}_done"
+    name = out_name or revision
+    bin_path = Path(cache_dir) / f"{name}.bin"
+    done_flag = Path(cache_dir) / f".{name}_done"
 
     if done_flag.exists() and bin_path.exists():
         n = bin_n_tokens(str(bin_path))

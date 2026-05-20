@@ -46,14 +46,17 @@ def train_cli(args):
     tokenizer = load_hastings(args.hastings_path)
     print(f"  Tokenizer: vocab_size={tokenizer.vocab_size}")
 
-    if args.npy_repo:
-        # Load pre-tokenized .npy shards from HF
-        print(f"Downloading pre-tokenized data from {args.npy_repo} ...")
-        download_bin_shards(args.npy_repo, revision="phase1", hf_token=args.hf_token)
-        download_bin_shards(args.npy_repo, revision="phase2", hf_token=args.hf_token)
+    if args.bin_repo_p1:
+        print(f"Downloading pre-tokenized Phase 1 .bin shards from {args.bin_repo_p1} ...")
+        download_bin_shards(args.bin_repo_p1, revision="main", hf_token=args.hf_token, out_name="phase1")
     else:
         # Tokenize from scratch
         prepare_phase1_data(args.data, tokenizer, cache_dir="data")
+
+    if args.bin_repo_p2:
+        print(f"Downloading pre-tokenized Phase 2 .bin shards from {args.bin_repo_p2} ...")
+        download_bin_shards(args.bin_repo_p2, revision="main", hf_token=args.hf_token, out_name="phase2")
+    else:
         ds_exists = os.path.exists("data/phase2.bin")
         if not ds_exists:
             prepare_phase2_data(args.hf_dataset_p2, args.n_samples_p2, tokenizer, cache_dir="data")
@@ -437,8 +440,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="parv")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
-    parser.add_argument("--npy-repo", type=str, default=None,
-                        help="HF dataset repo with pre-tokenized .bin shards (skips local tokenization)")
+    parser.add_argument("--bin-repo-p1", type=str, default=None,
+                        help="HF dataset repo with pre-tokenized Phase 1 .bin shards")
+    parser.add_argument("--bin-repo-p2", type=str, default=None,
+                        help="HF dataset repo with pre-tokenized Phase 2 .bin shards")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
