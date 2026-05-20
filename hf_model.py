@@ -2,14 +2,14 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from config import ParvHFConfig
 from model import ParvModel
 
 
-class ParvForCausalLM(PreTrainedModel):
+class ParvForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = ParvHFConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True

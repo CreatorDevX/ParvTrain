@@ -207,7 +207,11 @@ def _train_impl(args):
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
         phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
-        num_workers=args.num_workers,
+        num_workers=args.num_workers, limit_range=(0.0, 0.99)
+    )
+    val_dataloader_p1 = build_dataloader(
+        phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
+        num_workers=args.num_workers, limit_range=(0.99, 1.0)
     )
 
     p1_tok_step = p1_bs * world_size * 1024
@@ -224,6 +228,11 @@ def _train_impl(args):
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
+    val_dataloader_p1 = accelerator.prepare(val_dataloader_p1)
+
+    if args.compile:
+        log("Compiling model via torch.compile...")
+        model = torch.compile(model)
 
     # ── HF repos ──
     hf_api = HfApi(token=args.hf_token) if args.hf_token else None
@@ -307,6 +316,91 @@ def _train_impl(args):
             metrics.update(extra)
         accelerator.log(metrics, step=step)
 
+    def run_validation(phase):
+        val_loader = val_dataloader_p1 if phase == 1 else val_dataloader_p2
+        model.eval()
+        val_loss = 0.0
+        val_steps = 0
+        with torch.no_grad():
+            for i, batch in enumerate(val_loader):
+                if i >= 20:
+                    break
+                out = model(input_ids=batch["input_ids"], labels=batch["labels"])
+                val_loss += out.loss.item()
+                val_steps += 1
+        avg_val_loss = val_loss / max(1, val_steps)
+        if torch.distributed.is_initialized():
+            avg_val_loss_t = torch.tensor(avg_val_loss, device=device)
+            torch.distributed.all_reduce(avg_val_loss_t, op=torch.distributed.ReduceOp.SUM)
+            avg_val_loss = avg_val_loss_t.item() / torch.distributed.get_world_size()
+        model.train()
+        return avg_val_loss
+
+    def run_inference_example():
+        model.eval()
+        prompt = "Once upon a time,"
+        input_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
+        unwrapped = accelerator.unwrap_model(model)
+        with torch.no_grad():
+            gen_ids = unwrapped.model.generate(input_ids, max_new_tokens=48, temperature=0.7, top_k=50)
+        gen_tokens = gen_ids[0].tolist()
+        gen_text = tokenizer.decode(gen_tokens)
+        if is_main:
+            log(f"--- Inference Example (step {step}) ---")
+            log(gen_text)
+            log("-----------------------------------------")
+        model.train()
+        return gen_text
+
+    def log_expert_utilization():
+        unwrapped = accelerator.unwrap_model(model)
+        moe_layers = []
+        for i, layer in enumerate(unwrapped.model.layers):
+            if layer.is_moe:
+                moe_layers.append((i, layer.ffn))
+        extra_metrics = {}
+        for i, moe_layer in moe_layers:
+            counts = moe_layer.expert_counts.clone()
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+            if is_main:
+                total_tokens = counts.sum().item()
+                if total_tokens > 0:
+                    percentages = (counts.float() / total_tokens * 100.0).cpu().tolist()
+                    for exp_idx, pct in enumerate(percentages):
+                        extra_metrics[f"expert_L{i}/exp_{exp_idx}_pct"] = pct
+            moe_layer.expert_counts.zero_()
+        return extra_metrics
+
+    def check_lr_override():
+        nonlocal scheduler
+        new_lr_tensor = torch.tensor([-1.0], device=device)
+        if is_main:
+            override_file = Path("lr_override.txt")
+            if override_file.exists():
+                try:
+                    content = override_file.read_text().strip()
+                    if content:
+                        new_lr_tensor[0] = float(content)
+                except Exception as e:
+                    log(f"Error reading lr_override.txt: {e}")
+                finally:
+                    try:
+                        override_file.unlink()
+                    except Exception:
+                        pass
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(new_lr_tensor, src=0)
+        new_lr = new_lr_tensor[0].item()
+        if new_lr > 0.0:
+            current_lr = scheduler.get_last_lr()[0]
+            if current_lr > 0:
+                factor = new_lr / current_lr
+                scheduler.base_lrs = [base_lr * factor for base_lr in scheduler.base_lrs]
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                log(f"Dynamic LR override applied: {current_lr:.6e} -> {new_lr:.6e} (scaled scheduler by {factor:.4f})")
+
     # ==================================================================
     # Phase 1
     # ==================================================================
@@ -314,6 +408,7 @@ def _train_impl(args):
     model.train()
     data_iter = iter(dataloader)
     best_loss = float("inf")
+    tokens_seen = 0
 
     while tokens_seen < args.total_tokens_p1:
         try:
@@ -321,6 +416,8 @@ def _train_impl(args):
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
+
+        check_lr_override()
 
         with accelerator.accumulate(model):
             out = model(input_ids=batch["input_ids"], labels=batch["labels"],
@@ -343,6 +440,18 @@ def _train_impl(args):
                     best_loss = min(best_loss, loss_val)
                     log(f"  P1 step={step:>6}  tok={tokens_seen:>10,}  loss={loss_val:.4f}")
                     log_metrics(1, 1024, loss_val)
+
+                if step % 100 == 0:
+                    val_loss = run_validation(1)
+                    log(f"  P1 val_loss={val_loss:.4f} (step {step})")
+                    extra = log_expert_utilization()
+                    extra["val/loss"] = val_loss
+                    log_metrics(1, 1024, out.loss.item(), extra)
+
+                if step % 250 == 0:
+                    gen_text = run_inference_example()
+                    if is_main:
+                        log_metrics(1, 1024, out.loss.item(), {"val/generation": gen_text})
 
                 if step % args.merge_interval == 0:
                     if not args.no_lora:
@@ -374,10 +483,17 @@ def _train_impl(args):
     for spec in p2_curriculum:
         loader = build_dataloader(phase2_bin, seq_len=spec.seq_len,
                                   batch_size=p2_bs, stride=512,
-                                  num_workers=args.num_workers)
+                                  num_workers=args.num_workers,
+                                  limit_range=(0.0, 0.99))
         loader = accelerator.prepare(loader)
         p2_loaders.append(loader)
         p2_iters.append(iter(loader))
+
+    val_dataloader_p2 = build_dataloader(
+        phase2_bin, seq_len=4096, batch_size=p2_bs, stride=512,
+        num_workers=args.num_workers, limit_range=(0.99, 1.0)
+    )
+    val_dataloader_p2 = accelerator.prepare(val_dataloader_p2)
 
     model.train()
     p2_tokens = 0
@@ -392,6 +508,8 @@ def _train_impl(args):
         except StopIteration:
             p2_iters[idx] = iter(p2_loaders[idx])
             batch = next(p2_iters[idx])
+
+        check_lr_override()
 
         with accelerator.accumulate(model):
             out = model(input_ids=batch["input_ids"], labels=batch["labels"],
@@ -416,6 +534,18 @@ def _train_impl(args):
                     best_loss = min(best_loss, loss_val)
                     log(f"  P2 step={step:>6}  tok={tokens_seen:>10,}  seq={spec.seq_len}  loss={loss_val:.4f}")
                     log_metrics(2, spec.seq_len, loss_val)
+
+                if step % 100 == 0:
+                    val_loss = run_validation(2)
+                    log(f"  P2 val_loss={val_loss:.4f} (step {step})")
+                    extra = log_expert_utilization()
+                    extra["val/loss"] = val_loss
+                    log_metrics(2, spec.seq_len, out.loss.item(), extra)
+
+                if step % 250 == 0:
+                    gen_text = run_inference_example()
+                    if is_main:
+                        log_metrics(2, spec.seq_len, out.loss.item(), {"val/generation": gen_text})
 
                 if step % args.merge_interval == 0:
                     if not args.no_lora:
@@ -474,6 +604,7 @@ if __name__ == "__main__":
     parser.add_argument("--tpu", action="store_true", help="Train on TPU using torch_xla")
     parser.add_argument("--num-tpus", type=int, default=8, help="Number of TPU cores to spawn")
     parser.add_argument("--no-lora", action="store_true", help="Disable LoRA and train all parameters")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile to optimize the model graph")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 

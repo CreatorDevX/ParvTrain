@@ -420,29 +420,45 @@ def download_bin_shards(
 # ---------------------------------------------------------------------------
 
 class MemmapDataset(Dataset):
-    def __init__(self, bin_path: str, seq_len: int, stride: int = 512):
+    def __init__(self, bin_path: str, seq_len: int, stride: int = 512, limit_range = None):
         self.bin_path = bin_path
         self.seq_len = seq_len
         self.stride = stride
         item_size = DTYPE().itemsize
         n_total = os.path.getsize(bin_path) // item_size
-        self._len = max(0, (n_total - seq_len) // stride) + 1
+        if limit_range is not None:
+            start_pct, end_pct = limit_range
+            self.start_token = int(n_total * start_pct)
+            self.end_token = int(n_total * end_pct)
+        else:
+            self.start_token = 0
+            self.end_token = n_total
+        n_avail = self.end_token - self.start_token
+        self._len = max(0, (n_avail - seq_len) // stride) + 1
+        self.data = None
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        data = np.memmap(self.bin_path, dtype=DTYPE, mode="r")
-        start = idx * self.stride
+        if self.data is None:
+            self.data = np.memmap(self.bin_path, dtype=DTYPE, mode="r")
+        data = self.data
+        
+        # Add random jitter to sequence boundaries to randomize token batches
+        jitter = int(torch.randint(0, self.stride, (1,)).item())
+        start = self.start_token + idx * self.stride + jitter
+        
         end = start + self.seq_len
-        if end > len(data):
+        if end > self.end_token:
             chunk = np.full(self.seq_len, 0, dtype=np.int64)
             labels = np.full(self.seq_len, -100, dtype=np.int64)
             mask = np.zeros(self.seq_len, dtype=np.int64)
-            avail = len(data) - start
-            chunk[:avail] = data[start:start+avail].astype(np.int64)
-            labels[:avail] = chunk[:avail]
-            mask[:avail] = 1
+            avail = max(0, self.end_token - start)
+            if avail > 0:
+                chunk[:avail] = data[start:start+avail].astype(np.int64)
+                labels[:avail] = chunk[:avail]
+                mask[:avail] = 1
         else:
             chunk = data[start:end].astype(np.int64)
             labels = chunk.copy()
@@ -458,8 +474,9 @@ def build_dataloader(
     batch_size: int = 8,
     stride: int = 512,
     num_workers: int = 4,
+    limit_range = None,
 ) -> DataLoader:
-    dataset = MemmapDataset(bin_path, seq_len=seq_len, stride=stride)
+    dataset = MemmapDataset(bin_path, seq_len=seq_len, stride=stride, limit_range=limit_range)
     kwargs = dict(
         batch_size=batch_size,
         shuffle=True,

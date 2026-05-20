@@ -372,6 +372,7 @@ class MoELayer(nn.Module):
         )
         self.router = nn.Linear(config.d_model, moe.n_routed_experts, bias=False)
         nn.init.normal_(self.router.weight, mean=0.0, std=moe.router_init_std)
+        self.register_buffer("expert_counts", torch.zeros(moe.n_routed_experts, dtype=torch.long))
 
     def forward(
         self,
@@ -405,6 +406,8 @@ class MoELayer(nn.Module):
 
         expert_mask = F.one_hot(top_k_indices, num_classes=n_experts).sum(dim=1)
         tokens_per_expert = expert_mask.sum(dim=0)
+        if self.training:
+            self.expert_counts.add_(tokens_per_expert)
 
         final_output = torch.zeros_like(x_flat)
 
@@ -414,8 +417,7 @@ class MoELayer(nn.Module):
             selected_indices = torch.where(selected)[0]
 
             if len(selected_indices) > capacity and moe.drop_overflow:
-                perm = torch.randperm(len(selected_indices), device=x.device)
-                selected_indices = selected_indices[perm[:capacity]]
+                selected_indices = selected_indices[:capacity]
 
             if len(selected_indices) > 0:
                 expert_input = x_flat[selected_indices]
