@@ -77,6 +77,10 @@ class ParvForCausalLM(PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, value):
         self.model.lm_head = value
 
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, ParvModel):
+            module.gradient_checkpointing = value
+
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
         return {"input_ids": input_ids, "use_cache": True}
 

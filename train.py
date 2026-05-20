@@ -185,6 +185,22 @@ def _train_impl(args):
     model = ParvForCausalLM(hf_config)
     log(f"Total params: {sum(p.numel() for p in model.parameters()):,}")
 
+    # Enable gradient checkpointing only when the user explicitly asks for it.
+    if args.gradient_checkpointing:
+        log("Enabling gradient checkpointing to save GPU memory...")
+        model.gradient_checkpointing_enable()
+
+    # Apply optional compute‑efficiency flags before training starts.
+    if args.use_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        log("TF32 matmul enabled for faster but slightly less precise training.")
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        log("cudnn.benchmark enabled for kernel auto‑tuning.")
+    # Set high‑precision matmul policy for float32 (helps on newer GPUs).
+    torch.set_float32_matmul_precision('high')
+
     # ── Parameters & Optimizer ──
     if args.no_lora:
         log("LoRA disabled. Training full parameters.")
@@ -197,12 +213,12 @@ def _train_impl(args):
         log(f"LoRA params: {n_lora:,}")
 
     try:
-        from Sophia import SophiaG
-        optimizer = SophiaG(train_params, lr=args.lr, betas=(0.965, 0.99), rho=0.01, weight_decay=1e-1)
-        log("Using SophiaG optimizer.")
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(train_params, lr=args.lr, weight_decay=0.1)
+        log("Using 8-bit AdamW optimizer (bitsandbytes).")
     except ImportError:
-        optimizer = AdamW(train_params, lr=args.lr, weight_decay=0.01)
-        log("Sophia not installed, using 32-bit AdamW optimizer.")
+        optimizer = AdamW(train_params, lr=args.lr, weight_decay=0.1)
+        log("bitsandbytes not installed, falling back to 32-bit AdamW optimizer.")
 
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
@@ -224,7 +240,15 @@ def _train_impl(args):
     log(f"Effective tok/step (P1): {p1_tok_step * p1_ga}")
     log(f"Steps — P1: ~{total_steps_p1}  P2: ~{total_steps_p2}  total: ~{total_steps}")
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    # Theorem: polynomially decaying learning rate \eta_t = 1/t^\gamma
+    gamma = 0.5
+    def poly_decay_lr(current_step: int):
+        warmup = args.warmup_steps
+        if current_step < warmup:
+            return float(current_step) / float(max(1, warmup))
+        return (float(current_step) / float(max(1, warmup))) ** (-gamma)
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, poly_decay_lr)
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
@@ -483,13 +507,31 @@ def _train_impl(args):
         with accelerator.accumulate(model):
             out = model(input_ids=batch["input_ids"], labels=batch["labels"],
                         global_step=step, warmup_steps=args.warmup_steps)
-            accelerator.backward(out.loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
-                )
-            optimizer.step()
-            optimizer.zero_grad()
+            loss_val = out.loss.item()
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                log(f"WARNING: NaN/Inf loss ({loss_val}) detected at step {step}. Skipping backward and zeroing grads.")
+                optimizer.zero_grad()
+            else:
+                accelerator.backward(out.loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
+                    )
+                    has_nan_or_inf = False
+                    for p in model.parameters():
+                        if p.requires_grad and p.grad is not None:
+                            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                                has_nan_or_inf = True
+                                break
+                    if has_nan_or_inf:
+                        log(f"WARNING: NaN/Inf detected in gradients at step {step}. Skipping optimizer step.")
+                        optimizer.zero_grad()
+                    else:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 step += 1
@@ -575,13 +617,31 @@ def _train_impl(args):
         with accelerator.accumulate(model):
             out = model(input_ids=batch["input_ids"], labels=batch["labels"],
                         global_step=step, warmup_steps=args.warmup_steps)
-            accelerator.backward(out.loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
-                )
-            optimizer.step()
-            optimizer.zero_grad()
+            loss_val = out.loss.item()
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                log(f"WARNING: NaN/Inf loss ({loss_val}) detected at step {step}. Skipping backward and zeroing grads.")
+                optimizer.zero_grad()
+            else:
+                accelerator.backward(out.loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad], max_norm=1.0,
+                    )
+                    has_nan_or_inf = False
+                    for p in model.parameters():
+                        if p.requires_grad and p.grad is not None:
+                            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                                has_nan_or_inf = True
+                                break
+                    if has_nan_or_inf:
+                        log(f"WARNING: NaN/Inf detected in gradients at step {step}. Skipping optimizer step.")
+                        optimizer.zero_grad()
+                    else:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 step += 1
@@ -667,7 +727,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-lora", action="store_true", help="Disable LoRA and train all parameters")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile to optimize the model graph")
     parser.add_argument("--hf-bucket", type=str, default=None, help="Hugging Face Bucket name to sync checkpoints")
+    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to save GPU memory")
     parser.add_argument("--no-resume", action="store_true")
+    # extra performance knobs
+    parser.add_argument("--use-tf32", action="store_true", help="Allow TF32 matmul on Ampere GPUs for speed (may reduce precision)")
+    parser.add_argument("--cudnn-benchmark", action="store_true", help="Enable torch.backends.cudnn.benchmark for faster kernels")
     args = parser.parse_args()
 
     train_cli(args)

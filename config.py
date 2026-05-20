@@ -15,9 +15,9 @@ class RoPEScalingConfig:
 
 @dataclass
 class MoEConfig:
-    n_routed_experts: int = 18
+    n_routed_experts: int = 16
     n_shared_experts: int = 1
-    top_k: int = 2
+    top_k: int = 1
     capacity_factor: float = 1.25
     aux_loss_alpha: float = 0.01
     z_loss_coeff: float = 1e-4
@@ -28,16 +28,16 @@ class MoEConfig:
 
 @dataclass
 class ModelConfig:
-    # ── ~152M total params / ~27M active params (excl. embedding) ──
+    # ── ~120M total params / ~17.2M active params (excl. embedding) ──
     # Total breakdown:
-    #   Embedding (tied):  12.3M
+    #   Embedding (tied):  12.6M
     #   Attention (10L):    3.9M
-    #   Dense FFN (2L):     1.8M
-    #   Shared expert (8L): 7.1M
-    #   Routed 18×8L:     127.4M
+    #   Dense FFN (2L):     1.5M
+    #   Shared expert (8L): 5.9M
+    #   Routed 16×8L:      95.2M
     #   Router+norms+glob:  0.1M
     # Active per token:
-    #   Attention: 3.9M + Dense: 1.8M + Shared: 7.1M + top-2 routed: 14.2M = ~27M
+    #   Attention: 3.9M + Dense: 1.5M + Shared: 5.9M + top-1 routed: 5.9M = ~17.2M
     vocab_size: int = 32768
     d_model: int = 384
     n_layers: int = 10
@@ -46,12 +46,12 @@ class ModelConfig:
     n_heads: int = 6
     n_kv_heads: int = 2
     d_head: int = 64
-    d_ff: int = 768
+    d_ff: int = 650
     activation: str = "swiglu"
     rope_base: int = 10000
     rope_scaling: Optional[RoPEScalingConfig] = None
     max_seq_len: int = 32768
-    sliding_window: int = 4096
+    sliding_window: int = 1024
     n_global_tokens: int = 32
     use_flash_attn: bool = True
     tie_word_embeddings: bool = True

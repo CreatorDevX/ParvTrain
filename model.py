@@ -423,11 +423,15 @@ class MoELayer(nn.Module):
                 expert_input = x_flat[selected_indices]
                 expert_out = self.routed_experts[expert_idx](expert_input)
 
-                for k in range(moe.top_k):
-                    expert_k_mask = top_k_indices[selected_indices, k] == expert_idx
-                    if expert_k_mask.any():
-                        w = top_k_weights[selected_indices, k][expert_k_mask].unsqueeze(-1)
-                        final_output[selected_indices[expert_k_mask]] += expert_out[expert_k_mask] * w
+                if moe.top_k == 1:
+                    w = top_k_weights[selected_indices, 0].unsqueeze(-1)
+                    final_output[selected_indices] += expert_out * w
+                else:
+                    for k in range(moe.top_k):
+                        expert_k_mask = top_k_indices[selected_indices, k] == expert_idx
+                        if expert_k_mask.any():
+                            w = top_k_weights[selected_indices, k][expert_k_mask].unsqueeze(-1)
+                            final_output[selected_indices[expert_k_mask]] += expert_out[expert_k_mask] * w
 
         shared_out = self.shared_expert(x_flat)
         final_output = final_output + shared_out
@@ -435,10 +439,8 @@ class MoELayer(nn.Module):
         aux_loss = x.new_zeros(1)
         if self.training and update_aux_loss:
             router_probs = F.softmax(router_logits.float(), dim=-1)
-            frac_tokens = torch.zeros(n_experts, device=x.device)
-            for k in range(moe.top_k):
-                for e in range(n_experts):
-                    frac_tokens[e] += (top_k_indices[:, k] == e).float().mean() / moe.top_k
+            # Vectorized frequency calculation avoiding nested Python loops
+            frac_tokens = F.one_hot(top_k_indices, num_classes=n_experts).float().mean(dim=(0, 1))
 
             router_prob_mean = router_probs.mean(dim=0)
             load_balance_loss = (
@@ -522,10 +524,15 @@ class ParvModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        n_layers = self.config.n_layers
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if "router" not in name and "lm_head" not in name:
-                    nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    std = 0.02
+                    # Scale down output projections to stabilize deep residual propagation
+                    if "o_proj" in name or "down_proj" in name:
+                        std = 0.02 / math.sqrt(2 * n_layers)
+                    nn.init.normal_(module.weight, mean=0.0, std=std)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
@@ -577,16 +584,39 @@ class ParvModel(nn.Module):
                     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
         total_aux_loss = hidden.new_zeros(1)
+        use_checkpoint = getattr(self, "gradient_checkpointing", False) and self.training
         for layer in self.layers:
-            hidden, aux_loss = layer(
-                hidden,
-                position_ids,
-                attention_mask,
-                use_kv_cache,
-                update_aux_loss,
-                global_step,
-                warmup_steps,
-            )
+            if use_checkpoint:
+                def create_custom_forward(target_layer):
+                    def custom_forward(h, pos_ids, attn_mask):
+                        return target_layer(
+                            h,
+                            pos_ids,
+                            attn_mask,
+                            use_kv_cache,
+                            update_aux_loss,
+                            global_step,
+                            warmup_steps,
+                        )
+                    return custom_forward
+
+                hidden, aux_loss = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden,
+                    position_ids,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden, aux_loss = layer(
+                    hidden,
+                    position_ids,
+                    attention_mask,
+                    use_kv_cache,
+                    update_aux_loss,
+                    global_step,
+                    warmup_steps,
+                )
             total_aux_loss = total_aux_loss + aux_loss
 
         hidden = self.norm(hidden)
