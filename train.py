@@ -9,7 +9,7 @@ import torch
 import torch.multiprocessing as tmp
 from torch.optim import AdamW
 from accelerate import Accelerator
-from accelerate.utils import GradientAccumulationPlugin
+from accelerate.utils import GradientAccumulationPlugin, DistributedDataParallelKwargs
 from huggingface_hub import HfApi, create_repo
 
 from config import ModelConfig, ParvHFConfig
@@ -87,9 +87,11 @@ def _train_impl(args):
         os.environ["WANDB_API_KEY"] = args.wandb_key
 
     ga_plugin = GradientAccumulationPlugin(num_steps=args.grad_accum_p1)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         log_with="wandb",
         gradient_accumulation_plugin=ga_plugin,
+        kwargs_handlers=[ddp_kwargs],
     )
     device = accelerator.device
     world_size = accelerator.num_processes
@@ -137,7 +139,7 @@ def _train_impl(args):
             "upload_model_interval": args.upload_model_interval,
             "num_gpus": world_size,
             "num_workers": args.num_workers,
-            "seq_len_p1": 2048,
+            "seq_len_p1": 1024,
             "p2_curriculum": [(s.seq_len, s.token_budget) for s in PHASE2_CURRICULUM],
             "model_config": {
                 "d_model": ModelConfig().d_model,
@@ -193,11 +195,11 @@ def _train_impl(args):
 
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
-        phase1_bin, seq_len=2048, batch_size=p1_bs, stride=512,
+        phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
         num_workers=args.num_workers,
     )
 
-    p1_tok_step = p1_bs * world_size * 2048
+    p1_tok_step = p1_bs * world_size * 1024
     total_steps_p1 = math.ceil(args.total_tokens_p1 / (p1_tok_step * p1_ga))
     # avg seq_len across curriculum: 4096×0.5 + 8192×0.3125 + 16384×0.125 + 32768×0.0625 = 8704
     avg_seq_p2 = 8704
