@@ -20,10 +20,10 @@ def stream_and_tokenize_phase2(
     tokenizer,
     out_dir: Path,
     hf_dataset: str = "openbmb/Ultra-FineWeb",
-    split: str = "train",
+    split: str = "en",
     n_samples: int = 50000,
     shard_size: int = 500_000_000,
-    text_field: str = "text",
+    text_field: str = "content",
 ):
     from datasets import load_dataset
 
@@ -48,7 +48,18 @@ def stream_and_tokenize_phase2(
         if n_samples is not None and i >= n_samples:
             break
 
-        text = row[text_field]
+        if text_field in row:
+            text = row[text_field]
+        elif "text" in row:
+            text = row["text"]
+        elif "content" in row:
+            text = row["content"]
+        else:
+            string_fields = [v for k, v in row.items() if isinstance(v, str)]
+            if string_fields:
+                text = string_fields[0]
+            else:
+                raise KeyError(f"Could not find field '{text_field}', 'text', or 'content' in dataset row. Available keys: {list(row.keys())}")
         ids = tokenizer.enc.encode(text, allowed_special="all") + [eos]
         arr = np.array(ids, dtype=DTYPE)
 
