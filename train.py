@@ -197,12 +197,12 @@ def _train_impl(args):
         log(f"LoRA params: {n_lora:,}")
 
     try:
-        from rose_opt import Rose
-        optimizer = Rose(train_params, lr=args.lr)
-        log("Using Rose optimizer.")
+        from Sophia import SophiaG
+        optimizer = SophiaG(train_params, lr=args.lr, betas=(0.965, 0.99), rho=0.01, weight_decay=1e-1)
+        log("Using SophiaG optimizer.")
     except ImportError:
         optimizer = AdamW(train_params, lr=args.lr, weight_decay=0.01)
-        log("Rose not installed, using 32-bit AdamW optimizer.")
+        log("Sophia not installed, using 32-bit AdamW optimizer.")
 
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
@@ -236,18 +236,61 @@ def _train_impl(args):
 
     # ── HF repos ──
     hf_api = HfApi(token=args.hf_token) if args.hf_token else None
-    if is_main and hf_api:
-        for repo in filter(None, [args.lora_repo, args.model_repo]):
+    username = None
+    bucket_name = None
+    if hf_api:
+        if is_main:
+            for repo in filter(None, [args.lora_repo, args.model_repo]):
+                try:
+                    create_repo(repo, private=True, token=args.hf_token, exist_ok=True)
+                    log(f"HF repo ready: {repo}")
+                except Exception as e:
+                    log(f"HF repo warning: {e}")
+        try:
+            username = hf_api.whoami()["name"]
+        except Exception:
+            pass
+
+    if args.hf_bucket:
+        bucket_name = args.hf_bucket
+        if "/" not in bucket_name and username:
+            bucket_name = f"{username}/{bucket_name}"
+        
+        if is_main and hf_api:
+            short_bucket_name = bucket_name.split("/")[-1]
             try:
-                create_repo(repo, private=True, token=args.hf_token, exist_ok=True)
-                log(f"HF repo ready: {repo}")
+                from huggingface_hub import create_bucket
+                create_bucket(short_bucket_name, exist_ok=True, token=args.hf_token)
+                log(f"HF Bucket ready: {bucket_name}")
             except Exception as e:
-                log(f"HF repo warning: {e}")
+                log(f"HF Bucket warning during creation: {e}")
 
     # ── resume ──
     step = 0
     tokens_seen = 0
     ckpt_dir = Path(args.checkpoint_dir) / "latest"
+    
+    if args.hf_bucket and not args.no_resume:
+        try:
+            from huggingface_hub import HfFileSystem
+            fs = HfFileSystem(token=args.hf_token)
+            remote_latest = f"hf://buckets/{bucket_name}/latest"
+            if is_main:
+                if fs.exists(remote_latest):
+                    log(f"Downloading checkpoint from HF Bucket: {remote_latest}")
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    files = fs.ls(remote_latest, detail=False)
+                    for f in files:
+                        filename = Path(f).name
+                        local_path = ckpt_dir / filename
+                        log(f"  Downloading {filename}...")
+                        fs.get(f"hf://{f}", str(local_path))
+                    log("Checkpoint downloaded successfully.")
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+        except Exception as e:
+            log(f"HF Bucket download failed or not found: {e}")
+
     if not args.no_resume and ckpt_dir.exists():
         log(f"Resuming from {ckpt_dir}")
         accelerator.load_state(str(ckpt_dir))
@@ -262,6 +305,24 @@ def _train_impl(args):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         accelerator.save_state(str(ckpt_dir))
         torch.save({"step": step, "tokens_seen": tokens_seen}, ckpt_dir / "trainer_state.pt")
+
+        if args.hf_bucket:
+            try:
+                from huggingface_hub import batch_bucket_files
+                files_to_upload = []
+                for p in ckpt_dir.iterdir():
+                    if p.is_file():
+                        files_to_upload.append((str(p), f"latest/{p.name}"))
+                if files_to_upload:
+                    log(f"Uploading {len(files_to_upload)} files to HF Bucket {bucket_name}...")
+                    batch_bucket_files(
+                        bucket_name,
+                        add=files_to_upload,
+                        token=args.hf_token
+                    )
+                    log("HF Bucket upload complete.")
+            except Exception as e:
+                log(f"HF Bucket upload failed: {e}")
 
     def push_lora():
         if hf_api is None or not args.lora_repo or not is_main:
@@ -605,6 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-tpus", type=int, default=8, help="Number of TPU cores to spawn")
     parser.add_argument("--no-lora", action="store_true", help="Disable LoRA and train all parameters")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile to optimize the model graph")
+    parser.add_argument("--hf-bucket", type=str, default=None, help="Hugging Face Bucket name to sync checkpoints")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
