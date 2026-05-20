@@ -63,16 +63,21 @@ def train_cli(args):
         else:
             print(f"  Phase 2 cache found: data/phase2.bin")
 
-    print("Data ready. Launching GPU processes...")
-    print()
-
-    # ── Spawn GPU processes (fast path — all cached) ──
-    tmp.set_start_method("spawn", force=True)
-    n = args.num_gpus or torch.cuda.device_count()
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29500"
-    os.environ["WORLD_SIZE"] = str(n)
-    tmp.spawn(_spawn_wrapper, args=(args,), nprocs=n, join=True)
+    if args.tpu:
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        n = args.num_tpus or 8
+        print(f"Launching TPU processes via XLA (cores={n})...")
+        os.environ["WORLD_SIZE"] = str(n)
+        xmp.spawn(_spawn_wrapper, args=(args,), nprocs=n, start_method="fork")
+    else:
+        print("Data ready. Launching GPU processes...")
+        print()
+        tmp.set_start_method("spawn", force=True)
+        n = args.num_gpus or torch.cuda.device_count()
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+        os.environ["WORLD_SIZE"] = str(n)
+        tmp.spawn(_spawn_wrapper, args=(args,), nprocs=n, join=True)
 
 
 def _spawn_wrapper(local_rank, args):
@@ -87,11 +92,13 @@ def _train_impl(args):
         os.environ["WANDB_API_KEY"] = args.wandb_key
 
     ga_plugin = GradientAccumulationPlugin(num_steps=args.grad_accum_p1)
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    kwargs_handlers = []
+    if not args.tpu:
+        kwargs_handlers.append(DistributedDataParallelKwargs(find_unused_parameters=True))
     accelerator = Accelerator(
         log_with="wandb",
         gradient_accumulation_plugin=ga_plugin,
-        kwargs_handlers=[ddp_kwargs],
+        kwargs_handlers=kwargs_handlers,
     )
     device = accelerator.device
     world_size = accelerator.num_processes
@@ -178,19 +185,23 @@ def _train_impl(args):
     model = ParvForCausalLM(hf_config)
     log(f"Total params: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ── LoRA ──
-    log(f"LoRA r={args.lora_r} on all linears + embedding...")
-    apply_lora(model, r=args.lora_r)
-    lora_params = [p for n, p in model.named_parameters() if "lora_" in n]
-    n_lora = sum(p.numel() for p in lora_params)
-    log(f"LoRA params: {n_lora:,}")
+    # ── Parameters & Optimizer ──
+    if args.no_lora:
+        log("LoRA disabled. Training full parameters.")
+        train_params = [p for p in model.parameters() if p.requires_grad]
+    else:
+        log(f"LoRA r={args.lora_r} on all linears + embedding...")
+        apply_lora(model, r=args.lora_r)
+        train_params = [p for n, p in model.named_parameters() if "lora_" in n]
+        n_lora = sum(p.numel() for p in train_params)
+        log(f"LoRA params: {n_lora:,}")
 
     try:
         from rose_opt import Rose
-        optimizer = Rose(lora_params, lr=args.lr)
+        optimizer = Rose(train_params, lr=args.lr)
         log("Using Rose optimizer.")
     except ImportError:
-        optimizer = AdamW(lora_params, lr=args.lr, weight_decay=0.01)
+        optimizer = AdamW(train_params, lr=args.lr, weight_decay=0.01)
         log("Rose not installed, using 32-bit AdamW optimizer.")
 
     # ── dataloader (phase 1) ──
@@ -333,12 +344,13 @@ def _train_impl(args):
                     log_metrics(1, 2048, out.loss.item())
 
                 if step % args.merge_interval == 0:
-                    log(f"Merging LoRA (step {step})...")
-                    merge_lora(model)
-                    push_lora()
-                    log_metrics(1, 2048, out.loss.item(), {"event": "lora_merge"})
-                    reset_lora(model, r=args.lora_r)
-                    optimizer.state.clear()
+                    if not args.no_lora:
+                        log(f"Merging LoRA (step {step})...")
+                        merge_lora(model)
+                        push_lora()
+                        log_metrics(1, 2048, out.loss.item(), {"event": "lora_merge"})
+                        reset_lora(model, r=args.lora_r)
+                        optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
@@ -402,12 +414,13 @@ def _train_impl(args):
                     log_metrics(2, spec.seq_len, out.loss.item())
 
                 if step % args.merge_interval == 0:
-                    log(f"Merging LoRA (step {step})...")
-                    merge_lora(model)
-                    push_lora()
-                    log_metrics(2, spec.seq_len, out.loss.item(), {"event": "lora_merge"})
-                    reset_lora(model, r=args.lora_r)
-                    optimizer.state.clear()
+                    if not args.no_lora:
+                        log(f"Merging LoRA (step {step})...")
+                        merge_lora(model)
+                        push_lora()
+                        log_metrics(2, spec.seq_len, out.loss.item(), {"event": "lora_merge"})
+                        reset_lora(model, r=args.lora_r)
+                        optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
@@ -452,6 +465,9 @@ if __name__ == "__main__":
                         help="HF dataset repo with pre-tokenized Phase 1 .bin shards")
     parser.add_argument("--bin-repo-p2", type=str, default=None,
                         help="HF dataset repo with pre-tokenized Phase 2 .bin shards")
+    parser.add_argument("--tpu", action="store_true", help="Train on TPU using torch_xla")
+    parser.add_argument("--num-tpus", type=int, default=8, help="Number of TPU cores to spawn")
+    parser.add_argument("--no-lora", action="store_true", help="Disable LoRA and train all parameters")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
