@@ -337,25 +337,28 @@ def _train_impl(args):
                 step += 1
                 scheduler.step()
                 tokens_seen += batch["input_ids"].numel() * world_size * p1_ga
-                best_loss = min(best_loss, out.loss.item())
 
                 if step % 20 == 0:
-                    log(f"  P1 step={step:>6}  tok={tokens_seen:>10,}  loss={out.loss.item():.4f}")
-                    log_metrics(1, 2048, out.loss.item())
+                    loss_val = out.loss.item()
+                    best_loss = min(best_loss, loss_val)
+                    log(f"  P1 step={step:>6}  tok={tokens_seen:>10,}  loss={loss_val:.4f}")
+                    log_metrics(1, 1024, loss_val)
 
                 if step % args.merge_interval == 0:
                     if not args.no_lora:
                         log(f"Merging LoRA (step {step})...")
                         merge_lora(model)
                         push_lora()
-                        log_metrics(1, 2048, out.loss.item(), {"event": "lora_merge"})
+                        loss_val = out.loss.item()
+                        log_metrics(1, 1024, loss_val, {"event": "lora_merge"})
                         reset_lora(model, r=args.lora_r)
                         optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
                     push_model()
-                    log_metrics(1, 2048, out.loss.item(), {"event": "model_push"})
+                    loss_val = out.loss.item()
+                    log_metrics(1, 1024, loss_val, {"event": "model_push"})
 
     # ==================================================================
     # Phase 2  (Ultra-FineWeb curriculum)
@@ -407,25 +410,28 @@ def _train_impl(args):
                 tok = batch["input_ids"].numel() * world_size * p2_ga
                 tokens_seen += tok
                 p2_tokens += tok
-                best_loss = min(best_loss, out.loss.item())
 
                 if step % 20 == 0:
-                    log(f"  P2 step={step:>6}  tok={tokens_seen:>10,}  seq={spec.seq_len}  loss={out.loss.item():.4f}")
-                    log_metrics(2, spec.seq_len, out.loss.item())
+                    loss_val = out.loss.item()
+                    best_loss = min(best_loss, loss_val)
+                    log(f"  P2 step={step:>6}  tok={tokens_seen:>10,}  seq={spec.seq_len}  loss={loss_val:.4f}")
+                    log_metrics(2, spec.seq_len, loss_val)
 
                 if step % args.merge_interval == 0:
                     if not args.no_lora:
                         log(f"Merging LoRA (step {step})...")
                         merge_lora(model)
                         push_lora()
-                        log_metrics(2, spec.seq_len, out.loss.item(), {"event": "lora_merge"})
+                        loss_val = out.loss.item()
+                        log_metrics(2, spec.seq_len, loss_val, {"event": "lora_merge"})
                         reset_lora(model, r=args.lora_r)
                         optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
                     push_model()
-                    log_metrics(2, spec.seq_len, out.loss.item(), {"event": "model_push"})
+                    loss_val = out.loss.item()
+                    log_metrics(2, spec.seq_len, loss_val, {"event": "model_push"})
 
     log("=== Training Complete ===")
     push_model()
