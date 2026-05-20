@@ -185,12 +185,11 @@ def load_hf_dataset_to_file(
 ):
     """Stream HF dataset to a text file on disk (never builds one giant string)."""
     from datasets import load_dataset
-    ds = load_dataset(name, split=split, streaming=False)
-    if n_samples is not None and n_samples < len(ds):
-        indices = random.sample(range(len(ds)), n_samples)
-        ds = ds.select(indices)
+    ds = load_dataset(name, split=split, streaming=True)
     with open(dst, "w", encoding="utf-8") as out:
         for i, row in enumerate(ds):
+            if n_samples is not None and i >= n_samples:
+                break
             out.write(row[text_field])
             out.write("\n\n")
 
@@ -335,13 +334,27 @@ def prepare_phase2_data(
     print(f"Loading {hf_dataset} ({n_samples} samples)...")
     raw_txt = str(Path(cache_dir) / "phase2_raw.txt")
     load_hf_dataset_to_file(hf_dataset, dst=raw_txt, n_samples=n_samples, text_field=text_field)
-    with open(raw_txt, "r", encoding="utf-8") as f:
-        text = f.read()
-    print(f"  Raw text: {len(text):,} chars")
 
     tmp_dir = Path(cache_dir) / "tmp_p2"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    n_tok = tokenize_to_bin(text, tokenizer, str(tmp_dir / "all.bin"), eos=True)
+
+    # Tokenize chunk-by-chunk to keep memory minimal
+    eos = tokenizer.eos_token_id
+    total_tokens = 0
+    with open(tmp_dir / "all.bin", "wb") as bin_f:
+        with open(raw_txt, "r", encoding="utf-8", errors="ignore") as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                ids = tokenizer.enc.encode(chunk, allowed_special="all")
+                total_tokens += len(ids)
+                arr = np.array(ids, dtype=np.uint16)
+                bin_f.write(arr.tobytes())
+        # append EOS
+        bin_f.write(np.array([eos], dtype=np.uint16).tobytes())
+        total_tokens += 1
+
     total = concatenate_bins([str(tmp_dir / "all.bin")], str(bin_path))
     print(f"  Tokenized: {total:,} tokens → {bin_path}")
     shutil.rmtree(tmp_dir, ignore_errors=True)

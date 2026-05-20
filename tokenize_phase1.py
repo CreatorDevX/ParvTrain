@@ -1,13 +1,6 @@
 """
-Standalone script: tokenize corpus → .npy shards → upload to HF Datasets.
+Standalone script: tokenize Phase 1 corpus → .bin shards → upload to HF Datasets.
 Zero OOM — tokens stream to disk, never accumulate in RAM.
-
-Usage:
-  python tokenize_dataset.py \
-    --hastings Hastings.pkl \
-    --hf-token hf_... \
-    --upload-repo your-user/parv-tokenized \
-    --phase2-samples 50000
 """
 
 import os
@@ -15,14 +8,12 @@ import json
 import pickle
 import shutil
 from pathlib import Path
-
 import numpy as np
 from tqdm.auto import tqdm
 
 from dataset import (
     load_hastings,
     download_text_files,
-    load_hf_dataset_to_file,
     DTYPE,
 )
 
@@ -42,14 +33,12 @@ THEMELIOS_URLS = [
 ]
 
 CHUNK_SIZE = 64 * 1024 * 1024      # 64 MB text chunks
-SHARD_TOKENS = 500_000_000         # 500M tokens per .npy shard (~1 GB as uint16)
+SHARD_TOKENS = 500_000_000         # 500M tokens per .bin shard (~1 GB as uint16)
 
 
 def tokenize_stream_to_bin(text_paths, tokenizer, dst):
-    """Tokenize files chunk-by-chunk, append tokens to a .bin file on disk.
-    Peak RAM: one 64 MB text chunk + its ~14M encoded tokens (~28 MB)."""
+    """Tokenize files chunk-by-chunk, append tokens to a .bin file on disk."""
     total = 0
-    n_files = len(text_paths)
     file_pbar = tqdm(text_paths, desc="Files", unit="file", position=0)
     with open(dst, "wb") as out:
         for p in file_pbar:
@@ -84,8 +73,7 @@ def tokenize_stream_to_bin(text_paths, tokenizer, dst):
 
 
 def split_bin(bin_path, out_dir, name="phase1"):
-    """Split a .bin file into SHARD_TOKENS-sized .bin shards via memmap.
-    Peak RAM: negligible."""
+    """Split a .bin file into SHARD_TOKENS-sized .bin shards via memmap."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -126,7 +114,7 @@ def tokenize_to_shards(text_paths, tokenizer, out_dir, name="phase1"):
     tmp_bin.unlink()
 
 
-def upload_to_hf(local_dir, repo_id, hf_token, revision=None):
+def upload_to_hf(local_dir, repo_id, hf_token, tokenizer, revision=None):
     from huggingface_hub import HfApi, create_repo
 
     api = HfApi(token=hf_token)
@@ -167,7 +155,6 @@ if __name__ == "__main__":
     parser.add_argument("--hf-token", required=True)
     parser.add_argument("--upload-repo", required=True)
     parser.add_argument("--cache-dir", default="data/tokenized_npy")
-    parser.add_argument("--phase2-samples", type=int, default=50_000)
     parser.add_argument("--skip-upload", action="store_true")
     args = parser.parse_args()
 
@@ -184,18 +171,7 @@ if __name__ == "__main__":
     print(f"  {len(local_files)} files cached")
     tokenize_to_shards(local_files, tokenizer, cache / "phase1", name="phase1")
 
-    # ── Phase 2: Ultra-FineWeb subset (streamed to file, never in RAM) ──
-    print("\n=== Phase 2: Ultra-FineWeb ===")
-    tmp_txt = cache / "_ultra_temp.txt"
-    load_hf_dataset_to_file(
-        "openbmb/Ultra-FineWeb", dst=str(tmp_txt),
-        n_samples=args.phase2_samples,
-    )
-    tokenize_to_shards([str(tmp_txt)], tokenizer, cache / "phase2", name="phase2")
-    tmp_txt.unlink()
-
     # ── Upload ──
     if not args.skip_upload:
-        print("\n=== Uploading ===")
-        upload_to_hf(cache / "phase1", args.upload_repo, args.hf_token, revision="phase1")
-        upload_to_hf(cache / "phase2", args.upload_repo, args.hf_token, revision="phase2")
+        print("\n=== Uploading Phase 1 ===")
+        upload_to_hf(cache / "phase1", args.upload_repo, args.hf_token, tokenizer, revision="phase1")
