@@ -186,12 +186,12 @@ def _train_impl(args):
     log(f"LoRA params: {n_lora:,}")
 
     try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(lora_params, lr=args.lr, weight_decay=0.01)
-        log("Using 8-bit AdamW optimizer.")
+        from rose_opt import Rose
+        optimizer = Rose(lora_params, lr=args.lr)
+        log("Using Rose optimizer.")
     except ImportError:
         optimizer = AdamW(lora_params, lr=args.lr, weight_decay=0.01)
-        log("Using 32-bit AdamW optimizer (bitsandbytes not installed).")
+        log("Rose not installed, using 32-bit AdamW optimizer.")
 
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
@@ -428,16 +428,16 @@ if __name__ == "__main__":
     parser.add_argument("--hf-dataset-p2", default="openbmb/Ultra-FineWeb")
     parser.add_argument("--n-samples-p2", type=int, default=50_000)
     parser.add_argument("--num-gpus", type=int, default=None)
-    parser.add_argument("--batch-size-p1", type=int, default=32, help="per GPU, phase 1")
+    parser.add_argument("--batch-size-p1", type=int, default=12, help="per GPU, phase 1")
     parser.add_argument("--grad-accum-p1", type=int, default=4)
     parser.add_argument("--batch-size-p2", type=int, default=2, help="per GPU, phase 2")
     parser.add_argument("--grad-accum-p2", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--lora-r", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=1000)
-    parser.add_argument("--total-tokens-p1", type=int, default=3_000_000_000)
-    parser.add_argument("--total-tokens-p2", type=int, default=250_000_000)
+    parser.add_argument("--total-tokens-p1", type=int, default=3_500_000_000)
+    parser.add_argument("--total-tokens-p2", type=int, default=500_000_000)
     parser.add_argument("--merge-interval", type=int, default=100)
     parser.add_argument("--upload-model-interval", type=int, default=2000)
     parser.add_argument("--lora-repo", type=str, default=None)
