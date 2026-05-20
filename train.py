@@ -183,7 +183,13 @@ def _train_impl(args):
     n_lora = sum(p.numel() for p in lora_params)
     log(f"LoRA params: {n_lora:,}")
 
-    optimizer = AdamW(lora_params, lr=args.lr, weight_decay=0.01)
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(lora_params, lr=args.lr, weight_decay=0.01)
+        log("Using 8-bit AdamW optimizer.")
+    except ImportError:
+        optimizer = AdamW(lora_params, lr=args.lr, weight_decay=0.01)
+        log("Using 32-bit AdamW optimizer (bitsandbytes not installed).")
 
     # ── dataloader (phase 1) ──
     dataloader = build_dataloader(
