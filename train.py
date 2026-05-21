@@ -25,7 +25,7 @@ from dataset import (
     StreamingHFDataset,
 )
 
-P1_SEQ_LEN = 2048
+P1_SEQ_LEN = 1024
 
 DEFAULT_DATA = [
     "https://huggingface.co/datasets/CreatorDevX/Themelios-11/resolve/main/Currentaffairs.txt",
@@ -246,7 +246,7 @@ def _train_impl(args):
             tokenizer=tokenizer,
             seq_len=P1_SEQ_LEN,
             split="train",
-            text_field="text",
+            text_field="content",
             is_val=True,
             val_size=1000
         )
