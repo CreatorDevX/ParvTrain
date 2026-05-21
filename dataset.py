@@ -553,3 +553,76 @@ class CurriculumDataloader(IterableDataset):
             self._iters[idx] = iter(self._loaders[idx])
             batch = next(self._iters[idx])
         return batch, self.curriculum[idx].seq_len
+
+
+class StreamingHFDataset(IterableDataset):
+    def __init__(self, dataset_name: str, tokenizer, seq_len: int = 1024, split: str = "train", text_field: str = "text", is_val: bool = False, val_size: int = 1000):
+        self.dataset_name = dataset_name
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.split = split
+        self.text_field = text_field
+        self.is_val = is_val
+        self.val_size = val_size
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        from datasets import load_dataset
+        try:
+            ds = load_dataset(self.dataset_name, "en", split=self.split, streaming=True)
+        except Exception:
+            ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+
+        buffer = []
+        count = 0
+        
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+        else:
+            worker_id = 0
+            num_workers = 1
+
+        total_partitions = world_size * num_workers
+        partition_id = rank * num_workers + worker_id
+
+        for row in ds:
+            if self.is_val:
+                if count >= self.val_size:
+                    break
+            else:
+                if count < self.val_size:
+                    count += 1
+                    continue
+            
+            if count % total_partitions != partition_id:
+                count += 1
+                continue
+                
+            count += 1
+            text = row[self.text_field]
+            
+            if hasattr(self.tokenizer, "enc"):
+                ids = self.tokenizer.enc.encode(text, allowed_special="all")
+            else:
+                ids = self.tokenizer.encode(text)
+                
+            buffer.extend(ids)
+            buffer.append(self.tokenizer.eos_token_id)
+            
+            while len(buffer) >= self.seq_len:
+                chunk = buffer[:self.seq_len]
+                buffer = buffer[self.seq_len:]
+                yield {
+                    "input_ids": torch.tensor(chunk, dtype=torch.long),
+                    "labels": torch.tensor(chunk, dtype=torch.long),
+                    "attention_mask": torch.ones(self.seq_len, dtype=torch.long)
+                }

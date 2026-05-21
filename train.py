@@ -22,6 +22,7 @@ from dataset import (
     load_hastings,
     download_bin_shards,
     PHASE2_CURRICULUM,
+    StreamingHFDataset,
 )
 
 DEFAULT_DATA = [
@@ -46,7 +47,9 @@ def train_cli(args):
     tokenizer = load_hastings(args.hastings_path)
     print(f"  Tokenizer: vocab_size={tokenizer.vocab_size}")
 
-    if args.bin_repo_p1:
+    if args.phase1data_ufw_override:
+        print("Phase 1 data override enabled. Will stream openbmb/Ultra-FineWeb asynchronously during training.")
+    elif args.bin_repo_p1:
         print(f"Downloading pre-tokenized Phase 1 .bin shards from {args.bin_repo_p1} ...")
         download_bin_shards(args.bin_repo_p1, revision="main", hf_token=args.hf_token, out_name="phase1")
     else:
@@ -163,7 +166,10 @@ def _train_impl(args):
     )
 
     # ── data (cached from parent — instant) ──
-    phase1_bin = prepare_phase1_data(args.data, tokenizer, cache_dir="data")
+    if not args.phase1data_ufw_override:
+        phase1_bin = prepare_phase1_data(args.data, tokenizer, cache_dir="data")
+    else:
+        phase1_bin = None
 
     # ── model ──
     log("Creating model...")
@@ -221,14 +227,38 @@ def _train_impl(args):
         log("bitsandbytes not installed, falling back to 32-bit AdamW optimizer.")
 
     # ── dataloader (phase 1) ──
-    dataloader = build_dataloader(
-        phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
-        num_workers=args.num_workers, limit_range=(0.0, 0.99)
-    )
-    val_dataloader_p1 = build_dataloader(
-        phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
-        num_workers=args.num_workers, limit_range=(0.99, 1.0)
-    )
+    if args.phase1data_ufw_override:
+        log("Overriding Phase 1 data with streaming openbmb/Ultra-FineWeb...")
+        from torch.utils.data import DataLoader
+        train_ds = StreamingHFDataset(
+            dataset_name="openbmb/Ultra-FineWeb",
+            tokenizer=tokenizer,
+            seq_len=1024,
+            split="train",
+            text_field="text",
+            is_val=False,
+            val_size=1000
+        )
+        val_ds = StreamingHFDataset(
+            dataset_name="openbmb/Ultra-FineWeb",
+            tokenizer=tokenizer,
+            seq_len=1024,
+            split="train",
+            text_field="text",
+            is_val=True,
+            val_size=1000
+        )
+        dataloader = DataLoader(train_ds, batch_size=p1_bs, pin_memory=True, num_workers=args.num_workers)
+        val_dataloader_p1 = DataLoader(val_ds, batch_size=p1_bs, pin_memory=True, num_workers=args.num_workers)
+    else:
+        dataloader = build_dataloader(
+            phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
+            num_workers=args.num_workers, limit_range=(0.0, 0.99)
+        )
+        val_dataloader_p1 = build_dataloader(
+            phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
+            num_workers=args.num_workers, limit_range=(0.99, 1.0)
+        )
 
     p1_tok_step = p1_bs * world_size * 1024
     total_steps_p1 = math.ceil(args.total_tokens_p1 / (p1_tok_step * p1_ga))
@@ -275,44 +305,34 @@ def _train_impl(args):
         except Exception:
             pass
 
-    if args.hf_bucket:
-        bucket_name = args.hf_bucket
-        if "/" not in bucket_name and username:
-            bucket_name = f"{username}/{bucket_name}"
-        
-        if is_main and hf_api:
-            short_bucket_name = bucket_name.split("/")[-1]
-            try:
-                hf_api.create_bucket(bucket_name=short_bucket_name, exist_ok=True)
-                log(f"HF Bucket ready: {bucket_name}")
-            except Exception as e:
-                log(f"HF Bucket warning during creation: {e}")
+
 
     # ── resume ──
     step = 0
     tokens_seen = 0
     ckpt_dir = Path(args.checkpoint_dir) / "latest"
     
-    if args.hf_bucket and not args.no_resume:
+    repo_id = args.lora_repo if (args.lora_repo and not args.no_lora) else args.model_repo
+    if repo_id and not args.no_resume:
         try:
-            from huggingface_hub import HfFileSystem
-            fs = HfFileSystem(token=args.hf_token)
-            remote_latest = f"hf://buckets/{bucket_name}/latest"
             if is_main:
-                if fs.exists(remote_latest):
-                    log(f"Downloading checkpoint from HF Bucket: {remote_latest}")
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    files = fs.ls(remote_latest, detail=False)
-                    for f in files:
-                        filename = Path(f).name
-                        local_path = ckpt_dir / filename
-                        log(f"  Downloading {filename}...")
-                        fs.get(f"hf://{f}", str(local_path))
-                    log("Checkpoint downloaded successfully.")
+                log(f"Checking HF Repo for existing checkpoint: {repo_id}")
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id=repo_id,
+                    allow_patterns="latest/*",
+                    local_dir=str(ckpt_dir.parent),
+                    token=args.hf_token,
+                    repo_type="model"
+                )
+                if (ckpt_dir / "trainer_state.pt").exists():
+                    log("Checkpoint downloaded successfully from HF Repo.")
+                else:
+                    log("No checkpoint found in HF Repo under 'latest/'. Starting from scratch.")
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
         except Exception as e:
-            log(f"HF Bucket download failed or not found: {e}")
+            log(f"HF Repo download failed or not found: {e}")
 
     if not args.no_resume and ckpt_dir.exists():
         log(f"Resuming from {ckpt_dir}")
@@ -334,22 +354,19 @@ def _train_impl(args):
         accelerator.save_state(str(ckpt_dir))
         torch.save({"step": step, "tokens_seen": tokens_seen}, ckpt_dir / "trainer_state.pt")
 
-        if args.hf_bucket:
+        if repo_id:
             try:
                 api = hf_api if hf_api is not None else HfApi(token=args.hf_token)
-                files_to_upload = []
-                for p in ckpt_dir.iterdir():
-                    if p.is_file():
-                        files_to_upload.append((str(p), f"latest/{p.name}"))
-                if files_to_upload:
-                    log(f"Uploading {len(files_to_upload)} files to HF Bucket {bucket_name}...")
-                    api.batch_bucket_files(
-                        bucket_name=bucket_name,
-                        add=files_to_upload,
-                    )
-                    log("HF Bucket upload complete.")
+                log(f"Uploading checkpoint files to HF Repo {repo_id} under 'latest/'...")
+                api.upload_folder(
+                    folder_path=str(ckpt_dir),
+                    repo_id=repo_id,
+                    path_in_repo="latest",
+                    repo_type="model"
+                )
+                log("HF Repo upload complete.")
             except Exception as e:
-                log(f"HF Bucket upload failed: {e}")
+                log(f"HF Repo upload failed: {e}")
 
     def push_lora():
         if hf_api is None or not args.lora_repo or not is_main:
@@ -496,12 +513,14 @@ def _train_impl(args):
     model.train()
     data_iter = iter(dataloader)
     best_loss = float("inf")
-    tokens_seen = 0
+    tokens_at_start = tokens_seen
+    max_tokens_this_run = 150_000_000 if world_size == 1 else 400_000_000
+    log(f"Run token limit: {max_tokens_this_run:,} tokens. Resume point: {tokens_at_start:,} tokens.")
     import time
     last_time = time.time()
     last_tokens = tokens_seen
 
-    while tokens_seen < args.total_tokens_p1:
+    while tokens_seen < args.total_tokens_p1 and (tokens_seen - tokens_at_start) < max_tokens_this_run:
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -597,6 +616,24 @@ def _train_impl(args):
                     loss_val = out.loss.item()
                     log_metrics(1, 1024, loss_val, {"event": "model_push"})
 
+    if (tokens_seen - tokens_at_start) >= max_tokens_this_run:
+        log(f"Reached run token limit ({max_tokens_this_run:,} tokens). Saving checkpoint and exiting.")
+        if pbar is not None:
+            pbar.close()
+        save_ckpt()
+        push_model()
+        accelerator.end_training()
+        return
+
+    if not args.enable_phase2:
+        log("Phase 1 complete/resumed. Phase 2 not enabled (--enable-phase2 not set). Saving checkpoint and exiting.")
+        if pbar is not None:
+            pbar.close()
+        save_ckpt()
+        push_model()
+        accelerator.end_training()
+        return
+
     # ==================================================================
     # Phase 2  (Ultra-FineWeb curriculum)
     # ==================================================================
@@ -626,7 +663,7 @@ def _train_impl(args):
     model.train()
     p2_tokens = 0
     p2_weight_t = torch.tensor(p2_probs)
-    while p2_tokens < args.total_tokens_p2:
+    while p2_tokens < args.total_tokens_p2 and (tokens_seen - tokens_at_start) < max_tokens_this_run:
         # deterministic across DDP ranks (seeded by optimizer step)
         p2_rng = torch.Generator(device="cpu").manual_seed(42 + step * 1000003)
         idx = torch.multinomial(p2_weight_t, 1, generator=p2_rng).item()
@@ -731,7 +768,10 @@ def _train_impl(args):
     if pbar is not None:
         pbar.close()
 
-    log("=== Training Complete ===")
+    if (tokens_seen - tokens_at_start) >= max_tokens_this_run:
+        log(f"=== Stopped: Reached run token limit ({max_tokens_this_run:,} tokens) ===")
+    else:
+        log("=== Training Complete ===")
     push_model()
     final_loss = out.loss.item() if 'out' in dir() else best_loss
     log_metrics(2, 0, final_loss, {"event": "training_complete", "best_loss": best_loss})
@@ -762,7 +802,7 @@ if __name__ == "__main__":
     parser.add_argument("--hf-token", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--hastings-path", type=str, default="Hastings.pkl")
-    parser.add_argument("--wandb-project", type=str, default="parv")
+    parser.add_argument("--wandb-project", type=str, default="ParvLM")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-key", type=str, default=None)
     parser.add_argument("--bin-repo-p1", type=str, default=None,
@@ -776,6 +816,8 @@ if __name__ == "__main__":
     parser.add_argument("--hf-bucket", type=str, default=None, help="Hugging Face Bucket name to sync checkpoints")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to save GPU memory")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--enable-phase2", action="store_true", help="Enable transition to Phase 2 training")
+    parser.add_argument("--phase1data-ufw-override", action="store_true", help="Replace Phase 1 data with streaming openbmb/Ultra-FineWeb (~20k tok/s)")
     # extra performance knobs
     parser.add_argument("--use-tf32", action="store_true", help="Allow TF32 matmul on Ampere GPUs for speed (may reduce precision)")
     parser.add_argument("--cudnn-benchmark", action="store_true", help="Enable torch.backends.cudnn.benchmark for faster kernels")
