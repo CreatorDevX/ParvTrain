@@ -237,7 +237,7 @@ def _train_impl(args):
             tokenizer=tokenizer,
             seq_len=P1_SEQ_LEN,
             split="train",
-            text_field="text",
+            text_field="content",
             is_val=False,
             val_size=1000
         )
