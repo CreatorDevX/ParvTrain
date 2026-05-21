@@ -568,9 +568,10 @@ class StreamingHFDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         from datasets import load_dataset
         try:
-            ds = load_dataset(self.dataset_name, "en", split=self.split, streaming=True)
-        except Exception:
             ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+        except ValueError:
+            # Some datasets use language codes as splits (e.g. Ultra-FineWeb: 'en', 'zh')
+            ds = load_dataset(self.dataset_name, split="en", streaming=True)
 
         buffer = []
         count = 0
