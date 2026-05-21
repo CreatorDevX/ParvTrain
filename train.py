@@ -25,6 +25,8 @@ from dataset import (
     StreamingHFDataset,
 )
 
+P1_SEQ_LEN = 2048
+
 DEFAULT_DATA = [
     "https://huggingface.co/datasets/CreatorDevX/Themelios-11/resolve/main/Currentaffairs.txt",
     "https://huggingface.co/datasets/CreatorDevX/Themelios-11/resolve/main/TimeMagazine.txt",
@@ -149,7 +151,7 @@ def _train_impl(args):
             "upload_model_interval": args.upload_model_interval,
             "num_gpus": world_size,
             "num_workers": args.num_workers,
-            "seq_len_p1": 1024,
+            "seq_len_p1": P1_SEQ_LEN,
             "p2_curriculum": [(s.seq_len, s.token_budget) for s in PHASE2_CURRICULUM],
             "model_config": {
                 "d_model": ModelConfig().d_model,
@@ -233,7 +235,7 @@ def _train_impl(args):
         train_ds = StreamingHFDataset(
             dataset_name="openbmb/Ultra-FineWeb",
             tokenizer=tokenizer,
-            seq_len=1024,
+            seq_len=P1_SEQ_LEN,
             split="train",
             text_field="text",
             is_val=False,
@@ -242,25 +244,25 @@ def _train_impl(args):
         val_ds = StreamingHFDataset(
             dataset_name="openbmb/Ultra-FineWeb",
             tokenizer=tokenizer,
-            seq_len=1024,
+            seq_len=P1_SEQ_LEN,
             split="train",
             text_field="text",
             is_val=True,
             val_size=1000
         )
-        dataloader = DataLoader(train_ds, batch_size=p1_bs, pin_memory=True, num_workers=args.num_workers)
-        val_dataloader_p1 = DataLoader(val_ds, batch_size=p1_bs, pin_memory=True, num_workers=args.num_workers)
+        dataloader = DataLoader(train_ds, batch_size=p1_bs, pin_memory=True, num_workers=0)
+        val_dataloader_p1 = DataLoader(val_ds, batch_size=p1_bs, pin_memory=True, num_workers=0)
     else:
         dataloader = build_dataloader(
-            phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
+            phase1_bin, seq_len=P1_SEQ_LEN, batch_size=p1_bs, stride=256,
             num_workers=args.num_workers, limit_range=(0.0, 0.99)
         )
         val_dataloader_p1 = build_dataloader(
-            phase1_bin, seq_len=1024, batch_size=p1_bs, stride=256,
+            phase1_bin, seq_len=P1_SEQ_LEN, batch_size=p1_bs, stride=256,
             num_workers=args.num_workers, limit_range=(0.99, 1.0)
         )
 
-    p1_tok_step = p1_bs * world_size * 1024
+    p1_tok_step = p1_bs * world_size * P1_SEQ_LEN
     total_steps_p1 = math.ceil(args.total_tokens_p1 / (p1_tok_step * p1_ga))
     # avg seq_len across curriculum: 4096×0.5 + 8192×0.3125 + 16384×0.125 + 32768×0.0625 = 8704
     avg_seq_p2 = 8704
@@ -354,20 +356,6 @@ def _train_impl(args):
         accelerator.save_state(str(ckpt_dir))
         torch.save({"step": step, "tokens_seen": tokens_seen}, ckpt_dir / "trainer_state.pt")
 
-        if repo_id:
-            try:
-                api = hf_api if hf_api is not None else HfApi(token=args.hf_token)
-                log(f"Uploading checkpoint files to HF Repo {repo_id} under 'latest/'...")
-                api.upload_folder(
-                    folder_path=str(ckpt_dir),
-                    repo_id=repo_id,
-                    path_in_repo="latest",
-                    repo_type="model"
-                )
-                log("HF Repo upload complete.")
-            except Exception as e:
-                log(f"HF Repo upload failed: {e}")
-
     def push_lora():
         if hf_api is None or not args.lora_repo or not is_main:
             return
@@ -388,16 +376,40 @@ def _train_impl(args):
                                    repo_id=args.lora_repo, token=args.hf_token)
             log("  Tokenizer pushed")
 
+    def push_ckpt():
+        """Upload local checkpoint to lora repo under 'latest/' for resume."""
+        if hf_api is None or not is_main:
+            return
+        if not repo_id:
+            return
+        log(f"  Uploading checkpoint to {repo_id}/latest ...")
+        try:
+            hf_api.upload_folder(
+                folder_path=str(ckpt_dir),
+                repo_id=repo_id,
+                path_in_repo="latest",
+                repo_type="model",
+                token=args.hf_token,
+                delete_patterns="*",
+            )
+            log("  Checkpoint uploaded.")
+        except Exception as e:
+            log(f"  Checkpoint upload failed: {e}")
+
     def push_model():
-        if hf_api is None or not args.model_repo or not is_main:
+        if hf_api is None or not is_main:
+            return
+        target = args.model_repo or repo_id
+        if not target:
             return
         unwrapped = accelerator.unwrap_model(model)
         d = Path(args.checkpoint_dir) / f"model_{step}"
         d.mkdir(parents=True, exist_ok=True)
         unwrapped.save_pretrained(str(d))
         tokenizer.save_pretrained(str(d))
-        hf_api.upload_folder(folder_path=str(d), repo_id=args.model_repo,
-                             revision=f"step-{step}", token=args.hf_token)
+        log(f"  Uploading model to {target}/step-{step} ...")
+        hf_api.upload_folder(folder_path=str(d), repo_id=target,
+                             path_in_repo=f"step-{step}", token=args.hf_token)
         log(f"  Model pushed (step={step})")
         shutil.rmtree(d)
 
@@ -576,15 +588,15 @@ def _train_impl(args):
                     sec_per_20 = elapsed_seconds
                     
                     log(f"  P1 step={step:>6}  tok={tokens_seen:>10,}  loss={loss_val:.4f}  tok/s={tokens_per_sec:.1f}  sec/20_steps={sec_per_20:.2f}s")
-                    log_metrics(1, 1024, loss_val)
-                    
+                    log_metrics(1, P1_SEQ_LEN, loss_val)
+
                     if pbar is not None:
                         pbar.set_postfix({
                             "loss": f"{loss_val:.4f}",
                             "tok/s": f"{tokens_per_sec:.1f}",
                             "sec/20": f"{sec_per_20:.1f}s"
                         })
-                    
+
                     last_time = current_time
                     last_tokens = tokens_seen
 
@@ -593,12 +605,12 @@ def _train_impl(args):
                     log(f"  P1 val_loss={val_loss:.4f} (step {step})")
                     extra = log_expert_utilization()
                     extra["val/loss"] = val_loss
-                    log_metrics(1, 1024, out.loss.item(), extra)
+                    log_metrics(1, P1_SEQ_LEN, out.loss.item(), extra)
 
                 if step % 250 == 0:
                     gen_text = run_inference_example()
                     if is_main:
-                        log_metrics(1, 1024, out.loss.item(), {"val/generation": gen_text})
+                        log_metrics(1, P1_SEQ_LEN, out.loss.item(), {"val/generation": gen_text})
 
                 if step % args.merge_interval == 0:
                     if not args.no_lora:
@@ -606,21 +618,23 @@ def _train_impl(args):
                         merge_lora(model)
                         push_lora()
                         loss_val = out.loss.item()
-                        log_metrics(1, 1024, loss_val, {"event": "lora_merge"})
+                        log_metrics(1, P1_SEQ_LEN, loss_val, {"event": "lora_merge"})
                         reset_lora(model, r=args.lora_r)
                         optimizer.state.clear()
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
+                    push_ckpt()
                     push_model()
                     loss_val = out.loss.item()
-                    log_metrics(1, 1024, loss_val, {"event": "model_push"})
+                    log_metrics(1, P1_SEQ_LEN, loss_val, {"event": "model_push"})
 
     if (tokens_seen - tokens_at_start) >= max_tokens_this_run:
         log(f"Reached run token limit ({max_tokens_this_run:,} tokens). Saving checkpoint and exiting.")
         if pbar is not None:
             pbar.close()
         save_ckpt()
+        push_ckpt()
         push_model()
         accelerator.end_training()
         return
@@ -630,6 +644,7 @@ def _train_impl(args):
         if pbar is not None:
             pbar.close()
         save_ckpt()
+        push_ckpt()
         push_model()
         accelerator.end_training()
         return
@@ -761,6 +776,7 @@ def _train_impl(args):
                     save_ckpt()
 
                 if step % args.upload_model_interval == 0:
+                    push_ckpt()
                     push_model()
                     loss_val = out.loss.item()
                     log_metrics(2, spec.seq_len, loss_val, {"event": "model_push"})
@@ -772,6 +788,8 @@ def _train_impl(args):
         log(f"=== Stopped: Reached run token limit ({max_tokens_this_run:,} tokens) ===")
     else:
         log("=== Training Complete ===")
+    save_ckpt()
+    push_ckpt()
     push_model()
     final_loss = out.loss.item() if 'out' in dir() else best_loss
     log_metrics(2, 0, final_loss, {"event": "training_complete", "best_loss": best_loss})

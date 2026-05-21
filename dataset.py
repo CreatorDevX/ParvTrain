@@ -556,7 +556,7 @@ class CurriculumDataloader(IterableDataset):
 
 
 class StreamingHFDataset(IterableDataset):
-    def __init__(self, dataset_name: str, tokenizer, seq_len: int = 1024, split: str = "train", text_field: str = "text", is_val: bool = False, val_size: int = 1000):
+    def __init__(self, dataset_name: str, tokenizer, seq_len: int = 2048, split: str = "train", text_field: str = "text", is_val: bool = False, val_size: int = 1000):
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.seq_len = seq_len
